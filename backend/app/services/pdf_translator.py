@@ -244,28 +244,27 @@ class PDFTranslator:
         self,
         image_path: str,
         model: str = "qwen3.8-flash"
-    ) -> Dict[str, Any]:
+    ) -> str:
         """
-        针对纯图片/扫描件课件页面，提取页面标题、图表模块与正文要点
+        针对纯图片/扫描件课件页面，调用多模态大模型识别所有文字并翻译为中文。
+        返回完整的自然中文翻译文本（而非结构化 JSON，避免解析失败导致空白内容）。
         """
         with open(image_path, "rb") as f:
             b64_data = base64.b64encode(f.read()).decode("utf-8")
 
-        chosen_model = model if model in ["qwen3.8-flash", "qwen-vl-max", "qwen3.8-max", "qwen3.7-flash"] else "qwen3.8-flash"
+        vl_models = {"qwen3.8-flash", "qwen-vl-max", "qwen3.8-max", "qwen3.7-flash", "qwen3.5-ocr"}
+        chosen_model = model if model in vl_models else "qwen3.8-flash"
+
         prompt = (
-            "你是一个顶级的多模态课件与学术论文双语翻译专家。请识别并翻译此课件/论文页面中的全部内容。\n"
-            "以 JSON 格式输出：\n"
-            "{\n"
-            '  "title": "页面主标题中文翻译",\n'
-            '  "subtitle": "副标题（无则为空）",\n'
-            '  "modules": [\n'
-            '    {"title_zh": "图表模块中文名", "title_en": "英文原名", "desc": "模块功能说明"}\n'
-            "  ],\n"
-            '  "points": [\n'
-            '    "核心正文要点1",\n'
-            '    "核心正文要点2"\n'
-            "  ]\n"
-            "}"
+            "你是顶级的学术课件与论文双语翻译专家。"
+            "请仔细识别此图片中的所有文字内容（包括标题、正文、图例、注释和图表内的标签），"
+            "并将全部英文翻译为专业、流畅的中文。\n\n"
+            "输出要求：\n"
+            "1. 按照原文的结构顺序（从标题到正文到注释）翻译所有内容；\n"
+            "2. 图表中每个方框、节点、箭头旁的文字也必须翻译；\n"
+            "3. 数学公式、代码原样保留，仅翻译周围的说明文字；\n"
+            "4. 保留原有的层次结构（标题用【】标注，列表用 • 开头）；\n"
+            "5. 只输出中文翻译内容，不要输出任何说明或引导语。"
         )
 
         payload = {
@@ -285,14 +284,22 @@ class PDFTranslator:
         try:
             res = await self.client._raw_post_chat(payload)
             content = res["choices"][0]["message"].get("content", "").strip()
-            match = re.search(r"(\{.*\})", content, re.DOTALL)
-            if match:
-                data = json.loads(match.group(1))
-                if isinstance(data, dict):
-                    return data
+            if content:
+                return content
         except Exception:
             pass
-        return {"title": "课件图文对照精读", "modules": [], "points": []}
+
+        # 备用：换 qwen-vl-max 再试一次
+        try:
+            payload["model"] = "qwen-vl-max"
+            res = await self.client._raw_post_chat(payload)
+            content = res["choices"][0]["message"].get("content", "").strip()
+            if content:
+                return content
+        except Exception:
+            pass
+
+        return "（图片内容识别失败，请检查 API Key 与网络连接）"
 
     def _render_structured_page(self, target_page: fitz.Page, data: Dict[str, Any]):
         """
@@ -433,6 +440,58 @@ class PDFTranslator:
                 align=0
             )
 
+    def _render_text_page(self, target_page: fitz.Page, translated_text: str):
+        """
+        将自然中文翻译文本渲染到目标页面（白底，字号适中，排版清晰）。
+        用于轨道 B（扫描件/纯图页面）的翻译结果展示。
+        :param target_page: 目标 PDF 页面（已创建）
+        :param translated_text: 完整的中文翻译文本
+        """
+        w, h = target_page.rect.width, target_page.rect.height
+
+        # 白底背景
+        shape = target_page.new_shape()
+        shape.draw_rect(fitz.Rect(0, 0, w, h))
+        shape.finish(fill=(1.0, 1.0, 1.0))
+        shape.commit()
+
+        # 顶部浅蓝标题栏
+        header_h = max(32.0, min(54.0, h * 0.09))
+        sh = target_page.new_shape()
+        sh.draw_rect(fitz.Rect(0, 0, w, header_h))
+        sh.finish(fill=(0.90, 0.94, 1.0))
+        sh.draw_line(fitz.Point(0, header_h), fitz.Point(w, header_h))
+        sh.finish(color=(0.72, 0.82, 0.96), width=1.0)
+        sh.commit()
+
+        target_page.insert_textbox(
+            fitz.Rect(18.0, 7.0, w - 18.0, header_h - 6.0),
+            "中文翻译",
+            fontname="china-s",
+            fontsize=max(11.0, min(17.0, header_h * 0.40)),
+            color=(0.08, 0.20, 0.52),
+            align=0,
+        )
+
+        # 正文区域
+        content_top = header_h + 12.0
+        content_bottom = h - 12.0
+        margin_x = 18.0
+        body_font_size = max(10.0, min(14.0, w / 44.0))
+
+        # 尝试插入，必要时缩小字号
+        for scale in [1.0, 0.88, 0.76, 0.65]:
+            rc = target_page.insert_textbox(
+                fitz.Rect(margin_x, content_top, w - margin_x, content_bottom),
+                translated_text,
+                fontname="china-s",
+                fontsize=max(9.0, body_font_size * scale),
+                color=(0.06, 0.06, 0.08),
+                align=0,
+            )
+            if rc >= 0:
+                break
+
     def stitch_side_by_side_pdf(
         self,
         original_pdf_path: str,
@@ -564,22 +623,11 @@ class PDFTranslator:
                 except Exception:
                     pass
 
-            # 轨道 B：纯图表/扫描件页面（生成同尺寸高清结构化视读画板）
+            # 轨道 B：纯图表/扫描件页面（调用视觉大模型识别并翻译全部文字）
             else:
-                parsed_vision = await self._vision_translate_page(orig_img_path, model=model)
+                full_trans_text = await self._vision_translate_page(orig_img_path, model=model)
                 trans_page = trans_doc.new_page(width=orig_page.rect.width, height=orig_page.rect.height)
-                self._render_structured_page(trans_page, parsed_vision)
-
-                summary_parts = [f"【页面主题】：{parsed_vision.get('title', '')}"]
-                if parsed_vision.get("modules"):
-                    summary_parts.append("\n【图表模块解析】：")
-                    for m in parsed_vision.get("modules"):
-                        summary_parts.append(f"• {m.get('title_zh')} ({m.get('title_en')}): {m.get('desc')}")
-                if parsed_vision.get("points"):
-                    summary_parts.append("\n【核心要点】：")
-                    for p in parsed_vision.get("points"):
-                        summary_parts.append(f"- {p}")
-                full_trans_text = "\n".join(summary_parts)
+                self._render_text_page(trans_page, full_trans_text)
 
             # 3. 渲染中文翻译页面的高清缩略图
             pix_trans = trans_page.get_pixmap(dpi=150)
