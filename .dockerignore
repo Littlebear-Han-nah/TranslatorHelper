@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+node_modules
+frontend/node_modules
+frontend/dist
+uploads/*
+outputs/*
+!outputs/previews/.gitkeep
+brain
+scratch
+__pycache__
+*.pyc
+.DS_Store

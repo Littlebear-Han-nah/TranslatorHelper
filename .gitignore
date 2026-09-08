@@ -1,0 +1,20 @@
+# 依赖目录
+node_modules/
+frontend/node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 临时与上传生成文件（保留空目录结构）
+uploads/*
+!uploads/.gitkeep
+outputs/*
+!outputs/.gitkeep
+!outputs/previews/.gitkeep
+
+# 系统与 IDE 缓存
+.DS_Store
+.idea/
+.vscode/
+*.log

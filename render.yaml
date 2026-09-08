@@ -1,0 +1,17 @@
+# ==============================================================================
+# Render 官方一键部署蓝图配置 (Blueprint)
+# 用户将仓库连接到 Render 后，Render 会自动识别本文件并全自动部署
+# ==============================================================================
+services:
+  - type: web
+    name: bilingual-doc-translator
+    env: docker
+    plan: free
+    branch: main
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/config
+    envVars:
+      - key: DASHSCOPE_API_KEY
+        value: "sk-ws-H.PDDLLRH.BX6X.MEYCIQC44Nz2sYrwmcqIXL_2A0F4qNyajfPZ6R6_un8C3ELvLAIhAPIZX7JmML8t_m1rRe1U72JV2dAtfsaE6bRiCT6tNzUq"
+        sync: false
