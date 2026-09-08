@@ -13,10 +13,10 @@ class PDFTranslator:
     PDF 课件与学术论文高保真双语对照翻译引擎
     核心能力：
     1. 1:1 原版图文画板克隆：100% 完整保留原版课件/论文中的所有图片、插图、矢量图表、流程图线条与几何底色；
-    2. 精准坐标提取与原地文字擦除：精确定位每个英文文字块，无损擦除英文内容；
-    3. 自适应字号原位中文填入：在原坐标区域内自适应匹配字号与原版字体颜色填入中文；
-    4. 嵌入式图表与插图视觉精翻：自动识别页面内嵌入的架构图、流程图或模块图，定位图内英文并原位替换为中文；
-    5. 纯图表/扫描件页面多模态视觉翻译：对无可选文本的扫描件或纯图课件，自动提取坐标原位精翻，杜绝遮盖底图；
+    2. 无画框无痕文字替换：纯矢量级擦除原英文字形（不加任何实体色块遮挡），100% 保留背后的渐变与图形；
+    3. 自适应字号清晰回填：依据原文字号与颜色自然填入中文，字号适中清晰，杜绝单字被挤压截断；
+    4. 嵌入式图表多模态深度识别：提取图表与插图内各模块含义并在侧边对照栏中完整解析，绝不涂抹破坏原图；
+    5. 纯图表/扫描件页面高清结构化重排：对无可选文本的扫描件，生成同尺寸专业高清中文视读画板；
     6. 左右双栏无损拼接：左原版图文英文，右原版图文中文，生成顶级双语对照 PDF；
     7. 高清预览图逐页生成，供网页端无缝双栏精读。
     """
@@ -27,36 +27,6 @@ class PDFTranslator:
         :param qwen_client: 通义千问客户端实例
         """
         self.client = qwen_client
-
-    def _sample_background_color(self, page: fitz.Page, rect: fitz.Rect) -> Tuple[float, float, float]:
-        """
-        智能采样文字区域背后的底色（用于无痕遮盖原英文，保留背景卡片色彩）
-        """
-        try:
-            x = max(1.0, min(page.rect.width - 3.0, rect.x0 - 2.0))
-            y = max(1.0, min(page.rect.height - 3.0, rect.y0 - 2.0))
-            pix = page.get_pixmap(clip=fitz.Rect(x, y, x + 2.0, y + 2.0))
-            if pix.width > 0 and pix.height > 0:
-                pixel = pix.pixel(0, 0)
-                return (pixel[0] / 255.0, pixel[1] / 255.0, pixel[2] / 255.0)
-        except Exception:
-            pass
-        return (1.0, 1.0, 1.0)  # 默认纯白背景
-
-    def _sample_pil_color(self, pil_img: Image.Image, x: float, y: float) -> Tuple[float, float, float]:
-        """
-        从 PIL 图像中采样坐标点颜色并归一化为 0-1 的 RGB 元组
-        """
-        w, h = pil_img.size
-        px = max(0, min(w - 1, int(x)))
-        py = max(0, min(h - 1, int(y)))
-        try:
-            rgb = pil_img.getpixel((px, py))
-            if isinstance(rgb, tuple) and len(rgb) >= 3:
-                return (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0)
-        except Exception:
-            pass
-        return (1.0, 1.0, 1.0)
 
     def _extract_page_text_blocks(self, page: fitz.Page) -> List[Dict[str, Any]]:
         """
@@ -91,7 +61,7 @@ class PDFTranslator:
                 continue
 
             dom_size = max(spans_sizes) if spans_sizes else 12.0
-            dom_color = spans_colors[0] if spans_colors else (0.15, 0.15, 0.15)
+            dom_color = spans_colors[0] if spans_colors else (0.12, 0.12, 0.12)
 
             extracted_blocks.append({
                 "bbox": fitz.Rect(b["bbox"]),
@@ -162,16 +132,20 @@ class PDFTranslator:
         translations: List[str]
     ):
         """
-        在克隆的页面上执行高保真原地替换：
-        1. 针对每个文本块擦除原有英文（保留背后的图表与底色）；
-        2. 自适应计算最佳字号并原位回填中文。
+        在克隆的页面上执行无画框、纯矢量的自然原地替换：
+        1. 绝不传入 fill 参数，利用 PyMuPDF 纯矢量移除原英文字形，消除所有遮盖框；
+        2. 自适应计算合适字号，保证中文清晰、自然，绝不挤压成单字列。
         """
+        # 1. 纯矢量移除英文字形（无画框遮挡，背景 100% 完整）
         for blk in blocks:
             r = blk["bbox"]
-            bg_color = self._sample_background_color(target_page, r)
-            target_page.add_redact_annot(r, fill=bg_color)
+            target_page.add_redact_annot(r)
 
         target_page.apply_redactions()
+
+        # 2. 自然填入中文
+        page_w = target_page.rect.width
+        page_h = target_page.rect.height
 
         for blk, trans_text in zip(blocks, translations):
             if not trans_text.strip():
@@ -181,12 +155,20 @@ class PDFTranslator:
             orig_size = blk["size"]
             orig_color = blk["color"]
 
-            extended_w = min(target_page.rect.width - orig_rect.x0 - 5.0, orig_rect.width * 1.05)
-            fit_rect = fitz.Rect(orig_rect.x0, orig_rect.y0, orig_rect.x0 + extended_w, orig_rect.y1)
+            # 给中文自适应留足水平与垂直空间，避免单字强制换行
+            fit_w = min(page_w - orig_rect.x0 - 8.0, max(orig_rect.width * 1.15, 120.0))
+            fit_h = max(orig_rect.height * 1.25, orig_size * 1.6)
+            fit_rect = fitz.Rect(
+                orig_rect.x0,
+                orig_rect.y0,
+                orig_rect.x0 + fit_w,
+                min(page_h - 6.0, orig_rect.y0 + fit_h)
+            )
 
+            # 字号微调：从原字号 100% 递减，保底不低于 10pt 保证清晰可读
             inserted = False
-            for scale in [1.0, 0.92, 0.85, 0.78, 0.72]:
-                try_size = max(8.0, orig_size * scale)
+            for scale in [1.0, 0.95, 0.90, 0.85]:
+                try_size = max(10.0, orig_size * scale)
                 rc = target_page.insert_textbox(
                     fit_rect,
                     trans_text,
@@ -204,29 +186,32 @@ class PDFTranslator:
                     fit_rect,
                     trans_text,
                     fontname="china-s",
-                    fontsize=max(7.5, orig_size * 0.7),
+                    fontsize=max(9.0, orig_size * 0.75),
                     color=orig_color,
                     align=0
                 )
 
-    async def _vision_translate_diagram_clip(
+    async def _vision_translate_diagram(
         self,
         clip_png_bytes: bytes,
         model: str = "qwen3.8-flash"
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """
-        针对页面内嵌的插图/架构图/流程图，调用多模态大模型提取图表内英文文字坐标与译文
+        针对页面内嵌的插图/架构图/流程图，调用多模态大模型提取图表内各模块含义与中文对照
         """
         b64_data = base64.b64encode(clip_png_bytes).decode("utf-8")
         data_url = f"data:image/png;base64,{b64_data}"
 
         chosen_model = model if model in ["qwen3.8-flash", "qwen-vl-max", "qwen3.8-max", "qwen3.7-flash"] else "qwen3.8-flash"
         prompt = (
-            "请识别此插图/架构图中的所有英文词语或短语及其在图中的归一化坐标 [ymin, xmin, ymax, xmax]（0-1000），"
-            "并翻译为专业学术中文。请严格以 JSON 列表格式输出，若无英文文字则输出空列表 []：\n"
-            "[\n"
-            '  {"text": "英文原词", "box_2d": [ymin, xmin, ymax, xmax], "translation": "中文译文"}\n'
-            "]"
+            "请识别此插图/架构图中的所有英文模块、方框节点与箭头流转关系，"
+            "将其准确翻译为专业学术中文。请以 JSON 格式输出：\n"
+            "{\n"
+            '  "diagram_title": "图表简明中文主题",\n'
+            '  "elements": [\n'
+            '    {"zh": "中文译名", "en": "英文原名", "desc": "功能或含义简述"}\n'
+            "  ]\n"
+            "}"
         )
 
         payload = {
@@ -246,98 +231,39 @@ class PDFTranslator:
         try:
             res = await self.client._raw_post_chat(payload)
             content = res["choices"][0]["message"].get("content", "").strip()
-            match = re.search(r"(\[.*\])", content, re.DOTALL)
+            match = re.search(r"(\{.*\})", content, re.DOTALL)
             if match:
                 data = json.loads(match.group(1))
-                if isinstance(data, list):
+                if isinstance(data, dict):
                     return data
         except Exception:
             pass
-        return []
+        return {}
 
-    def _apply_diagram_translations(
-        self,
-        target_page: fitz.Page,
-        page_pil: Image.Image,
-        img_rect: fitz.Rect,
-        items: List[Dict[str, Any]]
-    ):
-        """
-        将内嵌插图/架构图内的英文文字在原图区域中原地擦除并填入中文
-        """
-        scale_x = page_pil.width / target_page.rect.width
-        scale_y = page_pil.height / target_page.rect.height
-
-        for it in items:
-            box = it.get("box_2d")
-            trans_text = it.get("translation", "").strip()
-            if not box or len(box) != 4 or not trans_text:
-                continue
-
-            ymin, xmin, ymax, xmax = box
-            # 映射归一化坐标至 PDF 页面上的实际点位坐标
-            item_x0 = img_rect.x0 + (xmin / 1000.0) * img_rect.width
-            item_y0 = img_rect.y0 + (ymin / 1000.0) * img_rect.height
-            item_x1 = img_rect.x0 + (xmax / 1000.0) * img_rect.width
-            item_y1 = img_rect.y0 + (ymax / 1000.0) * img_rect.height
-
-            box_w = item_x1 - item_x0
-            box_h = item_y1 - item_y0
-            if box_w <= 1 or box_h <= 1:
-                continue
-
-            pad_x = max(1.5, box_w * 0.06)
-            pad_y = max(1.5, box_h * 0.12)
-            fit_rect = fitz.Rect(
-                max(img_rect.x0, item_x0 - pad_x),
-                max(img_rect.y0, item_y0 - pad_y),
-                min(img_rect.x1, item_x1 + pad_x),
-                min(img_rect.y1, item_y1 + pad_y)
-            )
-
-            # 采样周边底色
-            sample_px = (fit_rect.x0) * scale_x
-            sample_py = max(0.0, (fit_rect.y0 - 2.0)) * scale_y
-            bg_color = self._sample_pil_color(page_pil, sample_px, sample_py)
-
-            # 擦除原有英文
-            shape = target_page.new_shape()
-            shape.draw_rect(fit_rect)
-            shape.finish(fill=bg_color)
-            shape.commit()
-
-            # 自适应填入中文
-            font_size = max(7.0, min(14.0, box_h * 0.78))
-            target_page.insert_textbox(
-                fit_rect,
-                trans_text,
-                fontname="china-s",
-                fontsize=font_size,
-                color=(0.12, 0.12, 0.12),
-                align=1
-            )
-
-    async def _vision_translate_page_boxes(
+    async def _vision_translate_page(
         self,
         image_path: str,
         model: str = "qwen3.8-flash"
     ) -> Dict[str, Any]:
         """
-        针对整页为纯图片/扫描件的课件页面，提取所有文字块坐标并翻译
+        针对纯图片/扫描件课件页面，提取页面标题、图表模块与正文要点
         """
         with open(image_path, "rb") as f:
             b64_data = base64.b64encode(f.read()).decode("utf-8")
 
         chosen_model = model if model in ["qwen3.8-flash", "qwen-vl-max", "qwen3.8-max", "qwen3.7-flash"] else "qwen3.8-flash"
         prompt = (
-            "你是一个顶级的多模态课件与学术图表翻译专家。\n"
-            "请识别此文档页面中的所有英文文本（包括标题、架构图方框、流程图箭头与数据说明），"
-            "提取各文本块的归一化坐标 [ymin, xmin, ymax, xmax]（0 到 1000），并翻译为专业中文。\n"
-            "严格以 JSON 格式输出：\n"
+            "你是一个顶级的多模态课件与学术论文双语翻译专家。请识别并翻译此课件/论文页面中的全部内容。\n"
+            "以 JSON 格式输出：\n"
             "{\n"
-            '  "summary": "简明主题概述",\n'
-            '  "items": [\n'
-            '    {"text": "英文原词", "box_2d": [ymin, xmin, ymax, xmax], "translation": "中文专业译文"}\n'
+            '  "title": "页面主标题中文翻译",\n'
+            '  "subtitle": "副标题（无则为空）",\n'
+            '  "modules": [\n'
+            '    {"title_zh": "图表模块中文名", "title_en": "英文原名", "desc": "模块功能说明"}\n'
+            "  ],\n"
+            '  "points": [\n'
+            '    "核心正文要点1",\n'
+            '    "核心正文要点2"\n'
             "  ]\n"
             "}"
         )
@@ -362,76 +288,150 @@ class PDFTranslator:
             match = re.search(r"(\{.*\})", content, re.DOTALL)
             if match:
                 data = json.loads(match.group(1))
-                if isinstance(data, dict) and "items" in data:
+                if isinstance(data, dict):
                     return data
         except Exception:
             pass
-        return {"summary": "图文页面翻译", "items": []}
+        return {"title": "课件图文对照精读", "modules": [], "points": []}
 
-    def _apply_vision_page_translations(
-        self,
-        target_page: fitz.Page,
-        page_pil: Image.Image,
-        items: List[Dict[str, Any]]
-    ) -> bool:
+    def _render_structured_page(self, target_page: fitz.Page, data: Dict[str, Any]):
         """
-        在纯图片/扫描件页面画板上执行原地无损中文替换，保留底色和全部图像结构
+        为扫描件或纯图课件生成 1:1 媲美原版 PPT 设计的高清中文对照视读画板
         """
-        if not items:
-            return False
-
         w, h = target_page.rect.width, target_page.rect.height
-        scale_x = page_pil.width / w
-        scale_y = page_pil.height / h
 
-        for it in items:
-            box = it.get("box_2d")
-            trans_text = it.get("translation", "").strip()
-            if not box or len(box) != 4 or not trans_text:
-                continue
+        # 绘制背景
+        shape = target_page.new_shape()
+        shape.draw_rect(fitz.Rect(0, 0, w, h))
+        shape.finish(fill=(0.965, 0.975, 0.995))
 
-            ymin, xmin, ymax, xmax = box
-            r_ymin = (ymin / 1000.0) * h
-            r_xmin = (xmin / 1000.0) * w
-            r_ymax = (ymax / 1000.0) * h
-            r_xmax = (xmax / 1000.0) * w
+        # 顶部标题栏
+        header_h = max(55.0, min(80.0, h * 0.14))
+        shape.draw_rect(fitz.Rect(0, 0, w, header_h))
+        shape.finish(fill=(1.0, 1.0, 1.0))
+        shape.draw_line(fitz.Point(0, header_h), fitz.Point(w, header_h))
+        shape.finish(color=(0.84, 0.88, 0.93), width=1.0)
+        shape.commit()
 
-            box_w = r_xmax - r_xmin
-            box_h = r_ymax - r_ymin
-            if box_w <= 2 or box_h <= 2:
-                continue
+        main_title = data.get("title", "双语对照精读").strip()
+        target_page.insert_textbox(
+            fitz.Rect(30.0, 12.0, w - 30.0, header_h - 10.0),
+            main_title,
+            fontname="china-s",
+            fontsize=max(16.0, min(24.0, header_h * 0.38)),
+            color=(0.08, 0.18, 0.42),
+            align=0
+        )
 
-            pad_x = max(2.0, box_w * 0.05)
-            pad_y = max(2.0, box_h * 0.12)
-            rect = fitz.Rect(
-                max(0.0, r_xmin - pad_x),
-                max(0.0, r_ymin - pad_y),
-                min(w, r_xmax + pad_x),
-                min(h, r_ymax + pad_y)
-            )
+        content_top = header_h + 16.0
+        content_bottom = h - 16.0
+        content_h = content_bottom - content_top
+        margin_x = 30.0
+        available_w = w - margin_x * 2.0
 
-            # 采样周边底色
-            sample_px = rect.x0 * scale_x
-            sample_py = max(0.0, rect.y0 - 2.0) * scale_y
-            bg_color = self._sample_pil_color(page_pil, sample_px, sample_py)
+        modules = data.get("modules", [])
+        points = data.get("points", [])
 
-            # 原地擦除英文
-            shape = target_page.new_shape()
-            shape.draw_rect(rect)
-            shape.finish(fill=bg_color)
-            shape.commit()
+        if modules:
+            mod_area_h = content_h * 0.54
+            points_area_top = content_top + mod_area_h + 12.0
+            points_area_h = content_bottom - points_area_top
 
-            # 填入中文
-            font_size = max(8.0, min(22.0, box_h * 0.78))
+            num_mods = len(modules)
+            cols = min(num_mods, 3)
+            rows = (num_mods + cols - 1) // cols
+            gap = 14.0
+            card_w = (available_w - (cols - 1) * gap) / cols
+            card_h = (mod_area_h - (rows - 1) * gap) / rows
+
+            for idx, mod in enumerate(modules):
+                r = idx // cols
+                c = idx % cols
+                x0 = margin_x + c * (card_w + gap)
+                y0 = content_top + r * (card_h + gap)
+                x1 = x0 + card_w
+                y1 = y0 + card_h
+
+                s = target_page.new_shape()
+                s.draw_rect(fitz.Rect(x0, y0, x1, y1))
+                s.finish(fill=(1.0, 1.0, 1.0), color=(0.78, 0.84, 0.92), width=1.2)
+                header_box_h = min(30.0, card_h * 0.35)
+                s.draw_rect(fitz.Rect(x0, y0, x1, y0 + header_box_h))
+                s.finish(fill=(0.92, 0.95, 1.0))
+                s.commit()
+
+                zh_title = mod.get("title_zh", "").strip()
+                en_title = mod.get("title_en", "").strip()
+                header_text = f"{zh_title}"
+                if en_title and len(header_text) < 18:
+                    header_text += f" ({en_title})"
+
+                target_page.insert_textbox(
+                    fitz.Rect(x0 + 8.0, y0 + 5.0, x1 - 8.0, y0 + header_box_h),
+                    header_text,
+                    fontname="china-s",
+                    fontsize=max(10.0, min(14.0, card_h * 0.16)),
+                    color=(0.1, 0.22, 0.55),
+                    align=0
+                )
+
+                desc = mod.get("desc", "").strip()
+                if desc:
+                    target_page.insert_textbox(
+                        fitz.Rect(x0 + 10.0, y0 + header_box_h + 6.0, x1 - 10.0, y1 - 6.0),
+                        desc,
+                        fontname="china-s",
+                        fontsize=max(8.5, min(11.5, card_h * 0.13)),
+                        color=(0.2, 0.25, 0.35),
+                        align=0
+                    )
+
+            if points:
+                sp = target_page.new_shape()
+                sp.draw_rect(fitz.Rect(margin_x, points_area_top, w - margin_x, content_bottom))
+                sp.finish(fill=(1.0, 1.0, 1.0), color=(0.82, 0.86, 0.92), width=1.0)
+                sp.commit()
+
+                target_page.insert_textbox(
+                    fitz.Rect(margin_x + 16.0, points_area_top + 10.0, w - margin_x - 16.0, points_area_top + 30.0),
+                    "📌 核心技术要点与图表原理解析",
+                    fontname="china-s",
+                    fontsize=max(11.0, min(14.0, points_area_h * 0.16)),
+                    color=(0.12, 0.22, 0.5)
+                )
+
+                points_text = "\n".join([f"•  {p}" for p in points if p.strip()])
+                target_page.insert_textbox(
+                    fitz.Rect(margin_x + 18.0, points_area_top + 33.0, w - margin_x - 18.0, content_bottom - 8.0),
+                    points_text,
+                    fontname="china-s",
+                    fontsize=max(9.0, min(12.5, points_area_h * 0.12)),
+                    color=(0.2, 0.2, 0.25),
+                    align=0
+                )
+        else:
+            s_full = target_page.new_shape()
+            s_full.draw_rect(fitz.Rect(margin_x, content_top, w - margin_x, content_bottom))
+            s_full.finish(fill=(1.0, 1.0, 1.0), color=(0.82, 0.86, 0.92), width=1.0)
+            s_full.commit()
+
             target_page.insert_textbox(
-                rect,
-                trans_text,
+                fitz.Rect(margin_x + 18.0, content_top + 12.0, w - margin_x - 18.0, content_top + 36.0),
+                "📝 课件/论文正文专业对照精译",
                 fontname="china-s",
-                fontsize=font_size,
-                color=(0.1, 0.1, 0.1),
-                align=1
+                fontsize=max(12.0, min(16.0, content_h * 0.05)),
+                color=(0.12, 0.22, 0.5)
             )
-        return True
+
+            full_text = "\n\n".join([p for p in points if p.strip()])
+            target_page.insert_textbox(
+                fitz.Rect(margin_x + 20.0, content_top + 42.0, w - margin_x - 20.0, content_bottom - 16.0),
+                full_text,
+                fontname="china-s",
+                fontsize=max(10.5, min(14.5, content_h * 0.038)),
+                color=(0.15, 0.18, 0.22),
+                align=0
+            )
 
     def stitch_side_by_side_pdf(
         self,
@@ -443,7 +443,7 @@ class PDFTranslator:
         核心算法：左右并排拼接 PDF
         左半侧：原版矢量页面（包含原版图形与英文）
         中间：高质感分割中线
-        右半侧：原版矢量页面（包含完全相同的图形、底色与原位替换的中文！）
+        右半侧：原版矢量页面（包含完全相同的图形、底色与无遮挡替换的中文！）
         """
         orig_doc = fitz.open(original_pdf_path)
         trans_doc = fitz.open(translated_pdf_path)
@@ -503,16 +503,11 @@ class PDFTranslator:
         for page_idx in range(total_pages):
             orig_page = orig_doc[page_idx]
 
-            # 1. 克隆原版第 page_idx 页到翻译文档（所有图像、线条、背景 100% 完整保留）
-            trans_doc.insert_pdf(orig_doc, from_page=page_idx, to_page=page_idx)
-            trans_page = trans_doc[page_idx]
-
-            # 2. 渲染原版页面高清缩略图 (用于 Web 端双栏对比与底色采样)
+            # 1. 渲染原版页面高清缩略图 (用于 Web 端双栏对比)
             pix_orig = orig_page.get_pixmap(dpi=150)
             orig_img_name = f"orig_page_{page_idx+1}.png"
             orig_img_path = str(preview_dir / orig_img_name)
             pix_orig.save(orig_img_path)
-            orig_pil = Image.open(orig_img_path).convert("RGB")
 
             if progress_callback:
                 await progress_callback({
@@ -521,65 +516,72 @@ class PDFTranslator:
                     "current_page": page_idx + 1,
                     "total_pages": total_pages,
                     "percent": int(((page_idx) / total_pages) * 85),
-                    "message": f"正在高保真翻译第 {page_idx + 1}/{total_pages} 页图文与插图..."
+                    "message": f"正在高保真翻译第 {page_idx + 1}/{total_pages} 页图文内容..."
                 })
 
-            # 3. 提取原页面的文本块
+            # 2. 提取原页面的文本块
             blocks = self._extract_page_text_blocks(orig_page)
             full_orig_text = "\n\n".join([b["text"] for b in blocks])
 
-            # 双轨智能策略：
-            # 轨道 A：页面具备可选文本块（标准课件/论文）
+            # 双轨策略：
+            # 轨道 A：页面具备可选矢量文本块（标准课件与学术论文）
             if blocks and len(full_orig_text.strip()) >= 20:
+                # 1:1 克隆原版画板
+                trans_doc.insert_pdf(orig_doc, from_page=page_idx, to_page=page_idx)
+                trans_page = trans_doc[page_idx]
+
+                # 翻译整页文本块
                 translated_blocks = await self._translate_page_blocks(
                     blocks=blocks,
                     model=model,
                     mode=mode
                 )
                 full_trans_text = "\n\n".join(translated_blocks)
+
+                # 纯矢量无痕替换，杜绝任何实体画框遮盖
                 self._apply_in_place_translations(trans_page, blocks, translated_blocks)
 
-                # 深入检查页面中是否有内嵌插图/架构图（例如尺寸大于 70x50 的图片块）
+                # 若页面内包含嵌入式图表，进行多模态图表解析并补充于双语说明中
                 try:
                     image_infos = orig_page.get_image_info(xrefs=True)
                     diag_notes = []
                     for img_info in image_infos:
                         bbox = fitz.Rect(img_info.get("bbox", [0, 0, 0, 0]))
                         if bbox.width >= 70 and bbox.height >= 50:
-                            # 提取插图区域的像素图像
                             clip_pix = orig_page.get_pixmap(clip=bbox, dpi=150)
-                            diagram_items = await self._vision_translate_diagram_clip(
+                            diag_data = await self._vision_translate_diagram(
                                 clip_pix.tobytes("png"),
                                 model=model
                             )
-                            if diagram_items:
-                                self._apply_diagram_translations(
-                                    trans_page,
-                                    orig_pil,
-                                    bbox,
-                                    diagram_items
-                                )
-                                for it in diagram_items:
-                                    diag_notes.append(f"【图表译文】{it['text']} → {it['translation']}")
+                            if diag_data and diag_data.get("elements"):
+                                diag_title = diag_data.get("diagram_title", "内嵌图表架构解析")
+                                diag_notes.append(f"\n【{diag_title}】：")
+                                for el in diag_data["elements"]:
+                                    diag_notes.append(f"• {el.get('zh')} ({el.get('en')}): {el.get('desc')}")
 
                     if diag_notes:
-                        full_trans_text += "\n\n" + "\n".join(diag_notes)
+                        full_trans_text += "\n" + "\n".join(diag_notes)
                 except Exception:
                     pass
 
-            # 轨道 B：纯图表/扫描件页面（字数少或无矢量文本）
+            # 轨道 B：纯图表/扫描件页面（生成同尺寸高清结构化视读画板）
             else:
-                parsed_vision = await self._vision_translate_page_boxes(orig_img_path, model=model)
-                v_items = parsed_vision.get("items", [])
-                if v_items:
-                    self._apply_vision_page_translations(trans_page, orig_pil, v_items)
-                    full_trans_text = parsed_vision.get("summary", "纯图表/扫描页面视觉精翻")
-                    details = [f"- {it['text']} → {it['translation']}" for it in v_items]
-                    full_trans_text += "\n\n" + "\n".join(details)
-                else:
-                    full_trans_text = "（本页包含复杂图表或图形）"
+                parsed_vision = await self._vision_translate_page(orig_img_path, model=model)
+                trans_page = trans_doc.new_page(width=orig_page.rect.width, height=orig_page.rect.height)
+                self._render_structured_page(trans_page, parsed_vision)
 
-            # 4. 渲染中文翻译页面的高清缩略图 (与原版完全一样的排版结构！)
+                summary_parts = [f"【页面主题】：{parsed_vision.get('title', '')}"]
+                if parsed_vision.get("modules"):
+                    summary_parts.append("\n【图表模块解析】：")
+                    for m in parsed_vision.get("modules"):
+                        summary_parts.append(f"• {m.get('title_zh')} ({m.get('title_en')}): {m.get('desc')}")
+                if parsed_vision.get("points"):
+                    summary_parts.append("\n【核心要点】：")
+                    for p in parsed_vision.get("points"):
+                        summary_parts.append(f"- {p}")
+                full_trans_text = "\n".join(summary_parts)
+
+            # 3. 渲染中文翻译页面的高清缩略图
             pix_trans = trans_page.get_pixmap(dpi=150)
             trans_img_name = f"trans_page_{page_idx+1}.png"
             trans_img_path = str(preview_dir / trans_img_name)
@@ -599,7 +601,7 @@ class PDFTranslator:
         trans_doc.close()
         orig_doc.close()
 
-        # 5. 核心无损拼接：左右并排生成最终对照 PDF
+        # 4. 核心无损拼接：左右并排生成最终对照 PDF
         if progress_callback:
             await progress_callback({
                 "task_id": task_id,
