@@ -189,7 +189,7 @@ class PDFTranslator:
                     break
 
             if not inserted:
-                target_page.insert_textbox(
+                rc2 = target_page.insert_textbox(
                     fit_rect,
                     trans_text,
                     fontname="china-s",
@@ -197,6 +197,15 @@ class PDFTranslator:
                     color=orig_color,
                     align=align
                 )
+                if rc2 < 0:
+                    # 保底机制：当文本框高度极小导致 insert_textbox 溢出静默丢弃时，使用 insert_text 绝对写入
+                    target_page.insert_text(
+                        fitz.Point(fit_rect.x0, min(page_h - 4.0, fit_rect.y0 + max(8.0, orig_size * 0.75) * 0.85)),
+                        trans_text,
+                        fontname="china-s",
+                        fontsize=max(8.0, orig_size * 0.75),
+                        color=orig_color
+                    )
 
     async def _vision_detect_and_translate_page(
         self,
@@ -301,13 +310,14 @@ class PDFTranslator:
             px1 = int(xmax * w_px / 1000.0)
             py1 = int(ymax * h_px / 1000.0)
 
-            pad = 2
+            # 外扩 3 像素边缘，确保完全覆盖原英文字形
+            pad = 3
             bx0 = max(0, px0 - pad)
             by0 = max(0, py0 - pad)
             bx1 = min(w_px, px1 + pad)
             by1 = min(h_px, py1 + pad)
 
-            # 纯 PIL 像素采样背景色
+            # 纯 PIL 像素采样背景色（周长像素中位数）
             border_pixels = []
             for x in range(bx0, bx1):
                 if by0 > 0:
@@ -329,18 +339,25 @@ class PDFTranslator:
             else:
                 bg_rgb = (255, 255, 255)
 
-            # 纯 PIL 采样文字颜色
-            text_rgb = (30, 30, 30)
-            min_lum = 255.0
+            bg_lum = 0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]
+
+            # 纯 PIL 最大对比度文字颜色采样算法（深底配高亮白字，浅底配深字，杜绝隐形）
+            best_diff = -1.0
+            text_rgb = (20, 25, 30) if bg_lum > 128 else (250, 250, 250)
             step_x = max(1, (px1 - px0) // 12)
             step_y = max(1, (py1 - py0) // 12)
             for y in range(py0, py1, step_y):
                 for x in range(px0, px1, step_x):
                     pv = orig_pil.getpixel((x, y))
                     lum = 0.299 * pv[0] + 0.587 * pv[1] + 0.114 * pv[2]
-                    if lum < min_lum:
-                        min_lum = lum
+                    diff = abs(lum - bg_lum)
+                    if diff > best_diff:
+                        best_diff = diff
                         text_rgb = pv[:3]
+
+            # 若反差不足 40，强制使用高对比度深色/浅色
+            if best_diff < 40:
+                text_rgb = (20, 25, 30) if bg_lum > 128 else (250, 250, 250)
 
             rect_pdf = fitz.Rect(bx0 * scale_x, by0 * scale_y, bx1 * scale_x, by1 * scale_y)
             bg_norm = (bg_rgb[0] / 255.0, bg_rgb[1] / 255.0, bg_rgb[2] / 255.0)
@@ -352,18 +369,38 @@ class PDFTranslator:
             s.finish(fill=bg_norm, stroke_opacity=0)
             s.commit()
 
-            # 写入中文
-            zh = it["zh"]
-            font_size = max(7.5, min(14.5, rect_pdf.height * 0.90))
+            # 写入中文（改用 insert_text 避免 insert_textbox 边界溢出静默丢弃文字）
+            zh = it.get("zh", "").strip()
+            if not zh:
+                continue
 
-            target_page.insert_textbox(
-                rect_pdf,
-                zh,
-                fontname="china-s",
-                fontsize=font_size,
-                color=text_norm,
-                align=1  # 居中对齐
-            )
+            font_size = max(7.0, min(14.0, rect_pdf.height * 1.15))
+            cx = (rect_pdf.x0 + rect_pdf.x1) / 2.0
+            cy = (rect_pdf.y0 + rect_pdf.y1) / 2.0
+
+            lines = [l.strip() for l in zh.split("\n") if l.strip()]
+            if not lines:
+                lines = [zh]
+
+            line_h = font_size * 1.2
+            start_y = cy - (len(lines) - 1) * line_h / 2.0 + font_size * 0.35
+
+            for i, line in enumerate(lines):
+                cur_font_size = font_size
+                tl = fitz.get_text_length(line, fontname="china-s", fontsize=cur_font_size)
+                if tl > (target_page.rect.width - 4.0):
+                    cur_font_size = max(6.0, cur_font_size * ((target_page.rect.width - 4.0) / tl))
+                    tl = fitz.get_text_length(line, fontname="china-s", fontsize=cur_font_size)
+
+                x_pt = max(2.0, min(target_page.rect.width - tl - 2.0, cx - tl / 2.0))
+                y_pt = start_y + i * line_h
+                target_page.insert_text(
+                    fitz.Point(x_pt, y_pt),
+                    line,
+                    fontname="china-s",
+                    fontsize=cur_font_size,
+                    color=text_norm
+                )
 
     async def stitch_side_by_side_pdf_from_images(
         self,
