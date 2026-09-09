@@ -1,10 +1,10 @@
 import base64
 import json
 import re
+import io
 from pathlib import Path
 from typing import Dict, Any, Optional, Callable, List, Tuple
 import fitz
-import numpy as np
 from PIL import Image
 from .qwen_client import QwenClient
 
@@ -15,9 +15,9 @@ class ImageTranslator:
     核心设计：
     1. 无痕原位替换：100% 完整保留原图的所有图形、架构图节点、边框、线条与背景；
     2. 多模态坐标定位：精确定位图片中所有文字区域的外接矩形（box_2d）及其对应的中文翻译；
-    3. 自适应背景采样：自动采样文字周边的背景色，消除原英文并原位自然填入居中清晰的中文；
+    3. 自适应背景采样：采用纯 PIL 像素算法自动采样文字周边的背景色，消除原英文并原位自然填入居中清晰的中文；
     4. 左右双栏对照并排导出：生成左原图、右原位中文对照的高清图与 PDF；
-    5. 使用 PyMuPDF 内置 china-s CJK 矢量字体，彻底杜绝云端乱码与空白问题。
+    5. 无第三方复杂依赖：无需 numpy 即可高性能运行，彻底杜绝云端 ModuleNotFoundError 与内存溢出。
     """
 
     def __init__(self, qwen_client: QwenClient):
@@ -57,7 +57,7 @@ class ImageTranslator:
             "要求：\n"
             "1. box_2d 为 0-1000 的归一化整数坐标 [ymin, xmin, ymax, xmax]；\n"
             "2. 务必覆盖图中全部英文标签与节点文字，切勿遗漏；\n"
-            "3. 仅输出合法 JSON 列表，切勿添加任何 Markdown 外部注释或寒暄。"
+            "3. 仅输出合法 JSON 列表，切勿添加任何外部注释或寒暄。"
         )
 
         payload = {
@@ -123,14 +123,13 @@ class ImageTranslator:
         output_img_path: str,
     ):
         """
-        在原图基础上进行无痕原位翻译：
+        在原图基础上进行无痕原位翻译（使用纯 PIL 像素算法，无需外部科学计算库）
         1. 以原图为底层画板，100% 保留所有几何图表、连线、边框与底色；
         2. 采样每个文字块周边背景色，擦除原英文；
         3. 原位居中填入中文，字号根据区域高宽自适应。
         """
         orig_pil = Image.open(input_image_path).convert("RGB")
         w_px, h_px = orig_pil.size
-        arr = np.array(orig_pil)
 
         scale = 72.0 / 150.0
         doc = fitz.open()
@@ -154,30 +153,40 @@ class ImageTranslator:
             bx1 = min(w_px, px1 + pad)
             by1 = min(h_px, py1 + pad)
 
-            # 采样周边背景色
+            # 纯 PIL 采样周边背景色
             border_pixels = []
-            if by0 > 0:
-                border_pixels.extend(arr[by0, bx0:bx1])
-            if by1 < h_px:
-                border_pixels.extend(arr[by1 - 1, bx0:bx1])
-            if bx0 > 0:
-                border_pixels.extend(arr[by0:by1, bx0])
-            if bx1 < w_px:
-                border_pixels.extend(arr[by0:by1, bx1 - 1])
+            for x in range(bx0, bx1):
+                if by0 > 0:
+                    border_pixels.append(orig_pil.getpixel((x, by0)))
+                if by1 < h_px:
+                    border_pixels.append(orig_pil.getpixel((x, by1 - 1)))
+            for y in range(by0, by1):
+                if bx0 > 0:
+                    border_pixels.append(orig_pil.getpixel((bx0, y)))
+                if bx1 < w_px:
+                    border_pixels.append(orig_pil.getpixel((bx1 - 1, y)))
 
             if border_pixels:
-                bg_rgb = np.median(border_pixels, axis=0).astype(int)
+                mid_idx = len(border_pixels) // 2
+                r_med = sorted(p[0] for p in border_pixels)[mid_idx]
+                g_med = sorted(p[1] for p in border_pixels)[mid_idx]
+                b_med = sorted(p[2] for p in border_pixels)[mid_idx]
+                bg_rgb = (r_med, g_med, b_med)
             else:
-                bg_rgb = np.array([255, 255, 255])
+                bg_rgb = (255, 255, 255)
 
-            # 采样文字颜色（取原框内最深像素）
-            box_pixels = arr[py0:py1, px0:px1]
-            if box_pixels.size > 0:
-                lums = 0.299 * box_pixels[:, :, 0] + 0.587 * box_pixels[:, :, 1] + 0.114 * box_pixels[:, :, 2]
-                min_idx = np.unravel_index(np.argmin(lums), lums.shape)
-                text_rgb = box_pixels[min_idx[0], min_idx[1]]
-            else:
-                text_rgb = np.array([30, 30, 30])
+            # 纯 PIL 采样文字颜色（取原框内最深像素）
+            text_rgb = (30, 30, 30)
+            min_lum = 255.0
+            step_x = max(1, (px1 - px0) // 12)
+            step_y = max(1, (py1 - py0) // 12)
+            for y in range(py0, py1, step_y):
+                for x in range(px0, px1, step_x):
+                    pv = orig_pil.getpixel((x, y))
+                    lum = 0.299 * pv[0] + 0.587 * pv[1] + 0.114 * pv[2]
+                    if lum < min_lum:
+                        min_lum = lum
+                        text_rgb = pv[:3]
 
             rect_pdf = fitz.Rect(bx0 * scale, by0 * scale, bx1 * scale, by1 * scale)
             bg_norm = (bg_rgb[0] / 255.0, bg_rgb[1] / 255.0, bg_rgb[2] / 255.0)
@@ -193,7 +202,6 @@ class ImageTranslator:
             zh = it["zh"]
             font_size = max(7.5, min(15.0, rect_pdf.height * 0.90))
 
-            # 适度自适应宽度避免换行
             text_len = len(zh)
             needed_w = text_len * font_size * 1.05
             if needed_w > rect_pdf.width:
@@ -370,14 +378,18 @@ class ImageTranslator:
         side_by_side_img_path = str(out_path / f"{task_id}_bilingual.png")
         bilingual_img.save(side_by_side_img_path, quality=95)
 
-        # 第五步：生成双语对照 PDF
+        # 第五步：生成双语对照 PDF（使用 JPEG 格式编码，速度快、体积小、杜绝内存溢出）
         side_by_side_pdf_path = str(out_path / f"{task_id}_bilingual_side_by_side.pdf")
         pdf_doc = fitz.open()
         pdf_w = bilingual_w * 72.0 / 150.0
         pdf_h = target_h * 72.0 / 150.0
         pdf_page = pdf_doc.new_page(width=pdf_w, height=pdf_h)
-        pdf_page.insert_image(pdf_page.rect, filename=side_by_side_img_path)
-        pdf_doc.save(side_by_side_pdf_path)
+
+        buf = io.BytesIO()
+        bilingual_img.save(buf, format="JPEG", quality=90)
+        buf.seek(0)
+        pdf_page.insert_image(pdf_page.rect, stream=buf.read())
+        pdf_doc.save(side_by_side_pdf_path, garbage=3, deflate=True)
         pdf_doc.close()
 
         # 第六步：生成纯中文原位 PDF
@@ -386,8 +398,12 @@ class ImageTranslator:
         pure_w = trans_rendered.width * 72.0 / 150.0
         pure_h = trans_rendered.height * 72.0 / 150.0
         pure_page = pure_doc.new_page(width=pure_w, height=pure_h)
-        pure_page.insert_image(pure_page.rect, filename=trans_img_path)
-        pure_doc.save(pure_trans_pdf_path)
+
+        buf_pure = io.BytesIO()
+        trans_rendered.save(buf_pure, format="JPEG", quality=90)
+        buf_pure.seek(0)
+        pure_page.insert_image(pure_page.rect, stream=buf_pure.read())
+        pure_doc.save(pure_trans_pdf_path, garbage=3, deflate=True)
         pure_doc.close()
 
         if progress_callback:
