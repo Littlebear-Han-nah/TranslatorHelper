@@ -266,7 +266,7 @@ class ImageTranslator:
         side_by_side_img_path = str(out_path / f"{task_id}_bilingual.png")
         bilingual_img.save(side_by_side_img_path, quality=95)
 
-        # 第六步：生成 PDF（将合并大图嵌入）
+        # 第六步：生成 PDF（将合并大图嵌入，彻底规避字体渲染问题）
         side_by_side_pdf_path = str(out_path / f"{task_id}_bilingual_side_by_side.pdf")
         pdf_doc = fitz.open()
         pdf_w = bilingual_w * 72.0 / 150.0
@@ -275,6 +275,14 @@ class ImageTranslator:
         pdf_page.insert_image(pdf_page.rect, filename=side_by_side_img_path)
         pdf_doc.save(side_by_side_pdf_path)
         pdf_doc.close()
+
+        # 同时生成纯中文版 PDF
+        pure_trans_pdf_path = str(out_path / f"{task_id}_chinese_only.pdf")
+        pure_doc = fitz.open()
+        pure_page = pure_doc.new_page(width=w_pt, height=h_pt)
+        pure_page.insert_image(pure_page.rect, filename=trans_img_path)
+        pure_doc.save(pure_trans_pdf_path)
+        pure_doc.close()
 
         if progress_callback:
             await progress_callback({
@@ -290,6 +298,7 @@ class ImageTranslator:
             "task_id": task_id,
             "total_pages": 1,
             "side_by_side_pdf": f"/outputs/{task_id}_bilingual_side_by_side.pdf",
+            "pure_trans_pdf": f"/outputs/{task_id}_chinese_only.pdf",
             "side_by_side_img": f"/outputs/{task_id}_bilingual.png",
             "pages": [
                 {

@@ -492,49 +492,54 @@ class PDFTranslator:
             if rc >= 0:
                 break
 
-    def stitch_side_by_side_pdf(
+    def stitch_side_by_side_pdf_from_images(
         self,
-        original_pdf_path: str,
-        translated_pdf_path: str,
-        output_pdf_path: str
+        orig_img_paths: List[str],
+        trans_img_paths: List[str],
+        output_pdf_path: str,
     ):
         """
-        核心算法：左右并排拼接 PDF
-        左半侧：原版矢量页面（包含原版图形与英文）
-        中间：高质感分割中线
-        右半侧：原版矢量页面（包含完全相同的图形、底色与无遮挡替换的中文！）
+        基于已渲染的高清 PNG 图片，逐页左右拼接生成双语对照 PDF。
+        采用光栅图片嵌入方式，彻底绕开 CJK 字体嵌入及 show_pdf_page 导致的阅读器空白问题，
+        确保在所有 PDF 阅读器（浏览器、macOS Preview、Adobe 等）中均 100% 正确显示中文。
+        :param orig_img_paths: 原版页面 PNG 路径列表（按页序）
+        :param trans_img_paths: 中文翻译页面 PNG 路径列表（按页序）
+        :param output_pdf_path: 输出双语对照 PDF 路径
         """
-        orig_doc = fitz.open(original_pdf_path)
-        trans_doc = fitz.open(translated_pdf_path)
+        import io
         merged_doc = fitz.open()
 
-        total_pages = min(len(orig_doc), len(trans_doc))
-        for i in range(total_pages):
-            p_orig = orig_doc[i]
-            p_trans = trans_doc[i]
+        for orig_img_path, trans_img_path in zip(orig_img_paths, trans_img_paths):
+            # 读取两张图片并统一高度
+            orig_im = Image.open(orig_img_path).convert("RGB")
+            trans_im = Image.open(trans_img_path).convert("RGB")
 
-            w_orig, h_orig = p_orig.rect.width, p_orig.rect.height
-            w_trans, h_trans = p_trans.rect.width, p_trans.rect.height
+            target_h = max(orig_im.height, trans_im.height)
 
-            target_w = w_orig + w_trans
-            target_h = max(h_orig, h_trans)
-            merged_page = merged_doc.new_page(width=target_w, height=target_h)
+            # 等比缩放到相同高度
+            orig_w = int(orig_im.width * target_h / orig_im.height)
+            trans_w = int(trans_im.width * target_h / trans_im.height)
+            orig_resized = orig_im.resize((orig_w, target_h), Image.Resampling.LANCZOS)
+            trans_resized = trans_im.resize((trans_w, target_h), Image.Resampling.LANCZOS)
 
-            # 1. 绘制左侧原版
-            merged_page.show_pdf_page(fitz.Rect(0, 0, w_orig, h_orig), orig_doc, i)
+            # 拼接为左右双栏（中间 3px 灰色分割线）
+            sep = 3
+            bilingual_im = Image.new("RGB", (orig_w + trans_w + sep, target_h), color=(180, 196, 220))
+            bilingual_im.paste(orig_resized, (0, 0))
+            bilingual_im.paste(trans_resized, (orig_w + sep, 0))
 
-            # 2. 绘制中缝分割线
-            shape = merged_page.new_shape()
-            shape.draw_line(fitz.Point(w_orig, 0), fitz.Point(w_orig, target_h))
-            shape.finish(color=(0.82, 0.85, 0.90), width=1.5)
-            shape.commit()
+            # 将拼接图嵌入 PDF 页面（图片按 150dpi 渲染，转换为 PDF pt）
+            pdf_w = (orig_w + trans_w + sep) * 72.0 / 150.0
+            pdf_h = target_h * 72.0 / 150.0
+            merged_page = merged_doc.new_page(width=pdf_w, height=pdf_h)
 
-            # 3. 绘制右侧高保真排版中文版
-            merged_page.show_pdf_page(fitz.Rect(w_orig, 0, target_w, h_trans), trans_doc, i)
+            # 把 PIL Image 转为字节流嵌入
+            buf = io.BytesIO()
+            bilingual_im.save(buf, format="PNG")
+            buf.seek(0)
+            merged_page.insert_image(merged_page.rect, stream=buf.read())
 
         merged_doc.save(output_pdf_path, garbage=4, deflate=True)
-        orig_doc.close()
-        trans_doc.close()
         merged_doc.close()
 
     async def translate_pdf(
@@ -556,17 +561,22 @@ class PDFTranslator:
         orig_doc = fitz.open(input_pdf_path)
         total_pages = len(orig_doc)
 
+        # 用于收集每页的原版与中文翻译 PNG 路径（供最终图片式 PDF 拼接使用）
+        all_orig_img_paths: List[str] = []
+        all_trans_img_paths: List[str] = []
+
         trans_doc = fitz.open()
         page_results = []
 
         for page_idx in range(total_pages):
             orig_page = orig_doc[page_idx]
 
-            # 1. 渲染原版页面高清缩略图 (用于 Web 端双栏对比)
+            # 1. 渲染原版页面高清缩略图 (用于 Web 端双栏对比 + 最终 PDF)
             pix_orig = orig_page.get_pixmap(dpi=150)
             orig_img_name = f"orig_page_{page_idx+1}.png"
             orig_img_path = str(preview_dir / orig_img_name)
             pix_orig.save(orig_img_path)
+            all_orig_img_paths.append(orig_img_path)
 
             if progress_callback:
                 await progress_callback({
@@ -575,7 +585,7 @@ class PDFTranslator:
                     "current_page": page_idx + 1,
                     "total_pages": total_pages,
                     "percent": int(((page_idx) / total_pages) * 85),
-                    "message": f"正在高保真翻译第 {page_idx + 1}/{total_pages} 页图文内容..."
+                    "message": f"正在翻译第 {page_idx + 1}/{total_pages} 页..."
                 })
 
             # 2. 提取原页面的文本块
@@ -587,7 +597,7 @@ class PDFTranslator:
             if blocks and len(full_orig_text.strip()) >= 20:
                 # 1:1 克隆原版画板
                 trans_doc.insert_pdf(orig_doc, from_page=page_idx, to_page=page_idx)
-                trans_page = trans_doc[page_idx]
+                trans_page = trans_doc[-1]
 
                 # 翻译整页文本块
                 translated_blocks = await self._translate_page_blocks(
@@ -600,40 +610,18 @@ class PDFTranslator:
                 # 纯矢量无痕替换，杜绝任何实体画框遮盖
                 self._apply_in_place_translations(trans_page, blocks, translated_blocks)
 
-                # 若页面内包含嵌入式图表，进行多模态图表解析并补充于双语说明中
-                try:
-                    image_infos = orig_page.get_image_info(xrefs=True)
-                    diag_notes = []
-                    for img_info in image_infos:
-                        bbox = fitz.Rect(img_info.get("bbox", [0, 0, 0, 0]))
-                        if bbox.width >= 70 and bbox.height >= 50:
-                            clip_pix = orig_page.get_pixmap(clip=bbox, dpi=150)
-                            diag_data = await self._vision_translate_diagram(
-                                clip_pix.tobytes("png"),
-                                model=model
-                            )
-                            if diag_data and diag_data.get("elements"):
-                                diag_title = diag_data.get("diagram_title", "内嵌图表架构解析")
-                                diag_notes.append(f"\n【{diag_title}】：")
-                                for el in diag_data["elements"]:
-                                    diag_notes.append(f"• {el.get('zh')} ({el.get('en')}): {el.get('desc')}")
-
-                    if diag_notes:
-                        full_trans_text += "\n" + "\n".join(diag_notes)
-                except Exception:
-                    pass
-
             # 轨道 B：纯图表/扫描件页面（调用视觉大模型识别并翻译全部文字）
             else:
                 full_trans_text = await self._vision_translate_page(orig_img_path, model=model)
                 trans_page = trans_doc.new_page(width=orig_page.rect.width, height=orig_page.rect.height)
                 self._render_text_page(trans_page, full_trans_text)
 
-            # 3. 渲染中文翻译页面的高清缩略图
+            # 3. 渲染中文翻译页面的高清 PNG（这是最终 PDF 的原材料）
             pix_trans = trans_page.get_pixmap(dpi=150)
             trans_img_name = f"trans_page_{page_idx+1}.png"
             trans_img_path = str(preview_dir / trans_img_name)
             pix_trans.save(trans_img_path)
+            all_trans_img_paths.append(trans_img_path)
 
             page_results.append({
                 "page": page_idx + 1,
@@ -643,13 +631,10 @@ class PDFTranslator:
                 "trans_img": f"/outputs/previews/{task_id}/{trans_img_name}",
             })
 
-        # 保存纯中文版 PDF
-        pure_trans_pdf_path = str(out_path / f"{task_id}_chinese_only.pdf")
-        trans_doc.save(pure_trans_pdf_path, garbage=4, deflate=True)
         trans_doc.close()
         orig_doc.close()
 
-        # 4. 核心无损拼接：左右并排生成最终对照 PDF
+        # 4. 基于 PNG 图片拼接生成最终双语对照 PDF 与纯中文版 PDF（彻底绕开 CJK 字体嵌入问题）
         if progress_callback:
             await progress_callback({
                 "task_id": task_id,
@@ -657,15 +642,27 @@ class PDFTranslator:
                 "current_page": total_pages,
                 "total_pages": total_pages,
                 "percent": 95,
-                "message": "正在无损合并生成左右双栏对照 PDF..."
+                "message": "正在合并生成左右双栏对照 PDF 与纯中文 PDF..."
             })
 
         side_by_side_pdf_path = str(out_path / f"{task_id}_bilingual_side_by_side.pdf")
-        self.stitch_side_by_side_pdf(
-            original_pdf_path=input_pdf_path,
-            translated_pdf_path=pure_trans_pdf_path,
-            output_pdf_path=side_by_side_pdf_path
+        self.stitch_side_by_side_pdf_from_images(
+            orig_img_paths=all_orig_img_paths,
+            trans_img_paths=all_trans_img_paths,
+            output_pdf_path=side_by_side_pdf_path,
         )
+
+        # 同时生成高保真纯中文版 PDF
+        pure_trans_pdf_path = str(out_path / f"{task_id}_chinese_only.pdf")
+        pure_doc = fitz.open()
+        for t_path in all_trans_img_paths:
+            t_im = Image.open(t_path)
+            p_w = t_im.width * 72.0 / 150.0
+            p_h = t_im.height * 72.0 / 150.0
+            p = pure_doc.new_page(width=p_w, height=p_h)
+            p.insert_image(p.rect, filename=t_path)
+        pure_doc.save(pure_trans_pdf_path, garbage=4, deflate=True)
+        pure_doc.close()
 
         if progress_callback:
             await progress_callback({
@@ -674,7 +671,7 @@ class PDFTranslator:
                 "current_page": total_pages,
                 "total_pages": total_pages,
                 "percent": 100,
-                "message": "高保真图文对照翻译已完成！"
+                "message": "双语对照翻译已完成！"
             })
 
         return {
