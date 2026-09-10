@@ -239,9 +239,18 @@ class PDFTranslator:
         # ── 步骤0：收集页面内图像块区域（用于后续避让）──────────────────────
         image_rects: List[fitz.Rect] = []
         try:
+            # 优先使用 get_image_info()，能正确检测 PPT 内嵌截图/位图
+            for info in target_page.get_image_info():
+                bbox = info.get("bbox")
+                if bbox:
+                    image_rects.append(fitz.Rect(bbox))
+        except Exception:
+            pass
+        # 兜底：通过 rawdict 补充 type=1 图像块
+        try:
             raw_dict = target_page.get_text("rawdict")
             for b in raw_dict.get("blocks", []):
-                if b.get("type") == 1:  # 图像块
+                if b.get("type") == 1:
                     image_rects.append(fitz.Rect(b["bbox"]))
         except Exception:
             pass
@@ -326,14 +335,14 @@ class PDFTranslator:
                     )
                     align = 1
                 else:
-                    # 计算文字框：高度按实际行数 × CJK 行高，宽度最大到页面右边
-                    fit_w = min(page_w - orig_rect.x0 - 8.0, max(orig_rect.width * 1.1, 80.0))
+                    # 宽度严格使用原文块右边界，绝不横向扩展（防止溢出进入图片区域）
+                    # 高度按实际翻译行数 × CJK 行高估算，允许垂直扩展
                     line_h = orig_size * 1.45
-                    fit_h = max(orig_rect.height, line_count * line_h) * 1.1
+                    fit_h = max(orig_rect.height, line_count * line_h) * 1.05
                     fit_rect = fitz.Rect(
                         orig_rect.x0,
                         orig_rect.y0,
-                        orig_rect.x0 + fit_w,
+                        orig_rect.x1,          # 严格用原文 x1，不扩展
                         min(page_h - 6.0, orig_rect.y0 + fit_h)
                     )
                     # 图片避让：如果文字框右侧超入图像区域，收窄 fit_rect.x1
