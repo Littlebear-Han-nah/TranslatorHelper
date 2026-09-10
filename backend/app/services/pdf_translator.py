@@ -204,6 +204,21 @@ class PDFTranslator:
 
         return final_translations
 
+    @staticmethod
+    def _pick_font(text: str) -> str:
+        """
+        根据文本内容自动选择渲染字体：
+        - 以中文为主（CJK ≥ 30%）→ 'china-s'（内置简体中文字体）
+        - 以拉丁/英文为主（缩写、英文段落）→ 'helv'（Helvetica，正确字距）
+        使用 helv 可彻底消除 china-s 把英文字母当全角渲染导致字距拉大的问题。
+        """
+        cjk = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+        latin = sum(1 for c in text if c.isascii() and c.isalpha())
+        total = cjk + latin
+        if total == 0:
+            return "china-s"
+        return "china-s" if cjk / total >= 0.3 else "helv"
+
     def _apply_in_place_translations(
         self,
         target_page: fitz.Page,
@@ -212,36 +227,62 @@ class PDFTranslator:
     ):
         """
         在克隆的页面上执行无画框、纯矢量的自然原地替换：
-        1. 仅移除纯文字字形（graphics=0, images=0），绝对不破坏底层任何背景、线条与矩形；
-        2. 自适应计算合适字号与对齐方式（图表节点居中对齐，段落文本左对齐）。
+        1. 扩展 redact bbox 2pt 消除残留英文碎片（防止字母以全角字距游离）；
+        2. 仅移除纯文字字形（graphics=0, images=0），绝不破坏底层图片与矢量线条；
+        3. 自动选字体：中文为主用 china-s，英文/缩写为主用 helv，彻底避免全角字距问题；
+        4. 检测页面图像区域，自动收窄文字插入框，防止文字覆盖在图片上；
+        5. 过滤空 bullet 块（仅有项目符号无正文）。
         """
-        # 1. 纯矢量移除英文字形（无画框遮挡，背景 100% 完整）
+        page_w = target_page.rect.width
+        page_h = target_page.rect.height
+
+        # ── 步骤0：收集页面内图像块区域（用于后续避让）──────────────────────
+        image_rects: List[fitz.Rect] = []
+        try:
+            raw_dict = target_page.get_text("rawdict")
+            for b in raw_dict.get("blocks", []):
+                if b.get("type") == 1:  # 图像块
+                    image_rects.append(fitz.Rect(b["bbox"]))
+        except Exception:
+            pass
+
+        # ── 步骤1：纯矢量移除英文字形（扩展 2pt 消除残留碎片）───────────────
+        redact_pad = 2.0
         for blk in blocks:
             r = blk["bbox"]
-            target_page.add_redact_annot(r)
+            padded = fitz.Rect(
+                r.x0 - redact_pad,
+                r.y0 - redact_pad,
+                r.x1 + redact_pad,
+                r.y1 + redact_pad,
+            )
+            target_page.add_redact_annot(padded)
 
         # 关键参数：images=0, graphics=0 确保绝不抹除底层图片与矢量线条
         target_page.apply_redactions(images=0, graphics=0)
 
-        # 2. 自然填入中文
-        page_w = target_page.rect.width
-        page_h = target_page.rect.height
-
+        # ── 步骤2：自然填入翻译文字 ──────────────────────────────────────────
         for blk, trans_text in zip(blocks, translations):
             raw_text = trans_text.strip()
             if not raw_text:
                 continue
 
-            # 应用 CJK 项目符号格式化（替换普通空格为 \xa0，防止分行渲染）
+            # 过滤空 bullet 块（仅有符号无正文，如 '•' 或 '-'）
+            import re as _re
+            if _re.fullmatch(r'[\s•\-\*·\u2022]+', raw_text):
+                continue
+
+            # 应用 CJK 项目符号格式化（防止 '•<空格>' 被 insert_textbox 在空格处断行）
             raw_text = self._fix_cjk_bullet_spacing(raw_text)
 
             orig_rect = blk["bbox"]
             orig_size = blk["size"]
             orig_color = blk["color"]
             is_cell = blk.get("is_table_cell", False)
+            font = self._pick_font(raw_text)
 
             if is_cell:
-                # 表格单元格：对单元格内居中写入，保持与单元格边界对齐
+                # 表格单元格：精确写入单元格内部，居中对齐
                 cell_rect = blk.get("cell_rect", orig_rect)
                 inner_pad = 2.0
                 fit_rect = fitz.Rect(
@@ -250,25 +291,23 @@ class PDFTranslator:
                     cell_rect.x1 - inner_pad,
                     cell_rect.y1 - inner_pad,
                 )
-                # 字号缩至单元格高度的 70%，多行时再缩减
                 cell_fs = max(7.5, min(orig_size, fit_rect.height * 0.7))
                 inserted = False
                 for fs_scale in [1.0, 0.85, 0.75, 0.65]:
                     try_size = max(7.0, cell_fs * fs_scale)
                     rc = target_page.insert_textbox(
                         fit_rect, raw_text,
-                        fontname="china-s", fontsize=try_size,
+                        fontname=font, fontsize=try_size,
                         color=orig_color, align=1
                     )
                     if rc >= 0:
                         inserted = True
                         break
                 if not inserted:
-                    # 保底：insert_text 单行写入
                     target_page.insert_text(
-                        fitz.Point(fit_rect.x0, fit_rect.y0 + min(fit_rect.height * 0.65, 14.0)),
-                        raw_text[:20],  # 单元格空间过小时截断
-                        fontname="china-s", fontsize=max(7.0, cell_fs * 0.65),
+                        fitz.Point(fit_rect.x0 + 1.0, fit_rect.y0 + min(fit_rect.height * 0.65, 14.0)),
+                        raw_text[:24],
+                        fontname=font, fontsize=max(7.0, cell_fs * 0.65),
                         color=orig_color
                     )
 
@@ -278,7 +317,6 @@ class PDFTranslator:
                 is_short_label = orig_rect.width < 140.0 and line_count == 1
 
                 if is_short_label:
-                    # 短标签/节点名称：居中对齐，左右适度留出边距
                     pad_w = max(4.0, orig_rect.width * 0.15)
                     fit_rect = fitz.Rect(
                         max(0, orig_rect.x0 - pad_w),
@@ -286,12 +324,11 @@ class PDFTranslator:
                         min(page_w, orig_rect.x1 + pad_w),
                         min(page_h, orig_rect.y1 + 2.0)
                     )
-                    align = 1  # 居中对齐
+                    align = 1
                 else:
-                    # 段落文本：高度保证至少容纳全部行数（CJK 行高约 1.4 倍字号）
+                    # 计算文字框：高度按实际行数 × CJK 行高，宽度最大到页面右边
                     fit_w = min(page_w - orig_rect.x0 - 8.0, max(orig_rect.width * 1.1, 80.0))
                     line_h = orig_size * 1.45
-                    # 高度 = max(原文高度, 行数 * 行高) + 10% buffer，保底不过页
                     fit_h = max(orig_rect.height, line_count * line_h) * 1.1
                     fit_rect = fitz.Rect(
                         orig_rect.x0,
@@ -299,15 +336,23 @@ class PDFTranslator:
                         orig_rect.x0 + fit_w,
                         min(page_h - 6.0, orig_rect.y0 + fit_h)
                     )
-                    align = 0  # 左对齐
+                    # 图片避让：如果文字框右侧超入图像区域，收窄 fit_rect.x1
+                    for img_r in image_rects:
+                        if (img_r.y0 < fit_rect.y1 and img_r.y1 > fit_rect.y0
+                                and img_r.x0 < fit_rect.x1 and img_r.x0 > fit_rect.x0):
+                            fit_rect = fitz.Rect(
+                                fit_rect.x0, fit_rect.y0,
+                                img_r.x0 - 4.0, fit_rect.y1
+                            )
+                    align = 0
 
-                # 字号微调：从原字号 100% 递减，保底不低于 9.5pt 保证清晰可读
+                # 字号递减尝试，保底 9.5pt
                 inserted = False
                 for scale in [1.0, 0.95, 0.90, 0.85, 0.80]:
                     try_size = max(9.5, orig_size * scale)
                     rc = target_page.insert_textbox(
                         fit_rect, raw_text,
-                        fontname="china-s", fontsize=try_size,
+                        fontname=font, fontsize=try_size,
                         color=orig_color, align=align
                     )
                     if rc >= 0:
@@ -317,17 +362,20 @@ class PDFTranslator:
                 if not inserted:
                     rc2 = target_page.insert_textbox(
                         fit_rect, raw_text,
-                        fontname="china-s", fontsize=max(8.5, orig_size * 0.75),
+                        fontname=font, fontsize=max(8.5, orig_size * 0.75),
                         color=orig_color, align=align
                     )
                     if rc2 < 0:
-                        # 保底机制：使用 insert_text 绝对写入，防止文字静默丢失
+                        # 保底：绝对写入，防止文字静默丢失
                         target_page.insert_text(
                             fitz.Point(fit_rect.x0, min(page_h - 4.0, fit_rect.y0 + max(8.0, orig_size * 0.75) * 0.85)),
                             raw_text,
-                            fontname="china-s", fontsize=max(8.0, orig_size * 0.75),
+                            fontname=font, fontsize=max(8.0, orig_size * 0.75),
                             color=orig_color
                         )
+
+
+
 
 
 
