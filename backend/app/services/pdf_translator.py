@@ -29,20 +29,105 @@ class PDFTranslator:
         """
         self.client = qwen_client
 
+    @staticmethod
+    def _fix_cjk_bullet_spacing(text: str) -> str:
+        """
+        修复 PyMuPDF 中 CJK 语境下项目符号渲染错位问题：
+        将 '•<空格>文字' 中的普通空格替换为不换行空格（\\xa0），
+        防止 insert_textbox 在符号后强制换行；
+        同时合并「符号单独成行 + 下一行是正文」的错误拆分格式。
+        """
+        lines = text.split("\n")
+        result = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # 情形 A：项目符号单独成行（如 OCR/翻译后拆行），合并到下一行
+            import re as _re
+            m_lone = _re.match(r'^(\s*)([•\-\*·\u2022])\s*$', line)
+            if m_lone and (i + 1) < len(lines) and lines[i + 1].strip():
+                lead = m_lone.group(1)
+                bullet = m_lone.group(2)
+                next_text = lines[i + 1].strip()
+                result.append(f'{"\u00a0" * len(lead)}{bullet}\u00a0{next_text}')
+                i += 2
+                continue
+            # 情形 B：正常「前导空格 + 项目符号 + 空格 + 正文」格式
+            m = _re.match(r'^(\s*)([•\-\*·\u2022])\s*(.*)$', line)
+            if m:
+                lead, bullet, rest = m.groups()
+                result.append(f'{"\u00a0" * len(lead)}{bullet}\u00a0{rest.strip()}')
+            else:
+                result.append(line)
+            i += 1
+        return "\n".join(result)
+
     def _extract_page_text_blocks(self, page: fitz.Page) -> List[Dict[str, Any]]:
         """
-        细粒度提取当前页面的所有文本块，包括外接矩形、文本内容、建议字号与文字颜色
+        细粒度提取当前页面的所有文本块，包括外接矩形、文本内容、建议字号与文字颜色。
+        支持表格单元格感知提取（通过 find_tables()）：
+        - 表格内部按单元格逐一提取，记录 is_table_cell=True 及精确 cell_rect
+        - 表格外部按默认 get_text dict 提取
         """
-        text_dict = page.get_text("dict")
-        extracted_blocks = []
+        extracted_blocks: List[Dict[str, Any]] = []
+        table_rects: List[fitz.Rect] = []
 
+        # ── 步骤1：识别表格区域并按单元格提取 ────────────────────────────────
+        try:
+            tabs = page.find_tables()
+            for tab in tabs.tables:
+                tab_rect = fitz.Rect(tab.bbox)
+                table_rects.append(tab_rect)
+                for row in tab.rows:
+                    for cell_bbox in row.cells:
+                        cell_rect = fitz.Rect(cell_bbox)
+                        cell_text = page.get_text("text", clip=cell_rect).strip()
+                        if not cell_text:
+                            continue
+                        # 从单元格内获取主导字号与颜色
+                        cell_dict = page.get_text("dict", clip=cell_rect)
+                        cell_sizes: List[float] = []
+                        cell_colors: List[tuple] = []
+                        for b in cell_dict.get("blocks", []):
+                            if b.get("type") != 0:
+                                continue
+                            for ln in b.get("lines", []):
+                                for sp in ln.get("spans", []):
+                                    if sp.get("text", "").strip():
+                                        cell_sizes.append(sp.get("size", 10.0))
+                                        c = sp.get("color", 0)
+                                        cell_colors.append((
+                                            ((c >> 16) & 255) / 255.0,
+                                            ((c >> 8) & 255) / 255.0,
+                                            (c & 255) / 255.0,
+                                        ))
+                        dom_size = max(cell_sizes) if cell_sizes else 10.0
+                        dom_color = cell_colors[0] if cell_colors else (0.1, 0.1, 0.1)
+                        extracted_blocks.append({
+                            "bbox": cell_rect,
+                            "text": cell_text,
+                            "size": dom_size,
+                            "color": dom_color,
+                            "is_table_cell": True,
+                            "cell_rect": cell_rect,
+                        })
+        except Exception:
+            pass  # find_tables 不可用时静默跳过
+
+        # ── 步骤2：提取表格区域以外的普通文本块 ─────────────────────────────
+        text_dict = page.get_text("dict")
         for b in text_dict.get("blocks", []):
-            if b.get("type") != 0:  # 0 为文本块，1 为图像块
+            if b.get("type") != 0:
+                continue
+
+            b_rect = fitz.Rect(b["bbox"])
+            # 跳过与表格区域重叠的 block（已在步骤1处理）
+            if any(b_rect.intersects(tr) for tr in table_rects):
                 continue
 
             block_text = ""
-            spans_sizes = []
-            spans_colors = []
+            spans_sizes: List[float] = []
+            spans_colors: List[tuple] = []
 
             for line in b.get("lines", []):
                 for span in line.get("spans", []):
@@ -65,10 +150,11 @@ class PDFTranslator:
             dom_color = spans_colors[0] if spans_colors else (0.12, 0.12, 0.12)
 
             extracted_blocks.append({
-                "bbox": fitz.Rect(b["bbox"]),
+                "bbox": b_rect,
                 "text": clean_text,
                 "size": dom_size,
                 "color": dom_color,
+                "is_table_cell": False,
             })
 
         return extracted_blocks
@@ -142,70 +228,108 @@ class PDFTranslator:
         page_h = target_page.rect.height
 
         for blk, trans_text in zip(blocks, translations):
-            if not trans_text.strip():
+            raw_text = trans_text.strip()
+            if not raw_text:
                 continue
+
+            # 应用 CJK 项目符号格式化（替换普通空格为 \xa0，防止分行渲染）
+            raw_text = self._fix_cjk_bullet_spacing(raw_text)
 
             orig_rect = blk["bbox"]
             orig_size = blk["size"]
             orig_color = blk["color"]
+            is_cell = blk.get("is_table_cell", False)
 
-            is_short_label = orig_rect.width < 140.0 and "\n" not in trans_text.strip()
-            if is_short_label:
-                # 短标签/节点名称：居中对齐，左右适度留出边距
-                pad_w = max(4.0, orig_rect.width * 0.15)
+            if is_cell:
+                # 表格单元格：对单元格内居中写入，保持与单元格边界对齐
+                cell_rect = blk.get("cell_rect", orig_rect)
+                inner_pad = 2.0
                 fit_rect = fitz.Rect(
-                    max(0, orig_rect.x0 - pad_w),
-                    orig_rect.y0,
-                    min(page_w, orig_rect.x1 + pad_w),
-                    min(page_h, orig_rect.y1 + 2.0)
+                    cell_rect.x0 + inner_pad,
+                    cell_rect.y0 + inner_pad,
+                    cell_rect.x1 - inner_pad,
+                    cell_rect.y1 - inner_pad,
                 )
-                align = 1  # 居中对齐
-            else:
-                # 段落文本：自适应水平与垂直空间
-                fit_w = min(page_w - orig_rect.x0 - 8.0, max(orig_rect.width * 1.15, 80.0))
-                fit_h = max(orig_rect.height * 1.25, orig_size * 1.6)
-                fit_rect = fitz.Rect(
-                    orig_rect.x0,
-                    orig_rect.y0,
-                    orig_rect.x0 + fit_w,
-                    min(page_h - 6.0, orig_rect.y0 + fit_h)
-                )
-                align = 0  # 左对齐
-
-            # 字号微调：从原字号 100% 递减，保底不低于 9.5pt 保证清晰可读
-            inserted = False
-            for scale in [1.0, 0.95, 0.90, 0.85]:
-                try_size = max(9.5, orig_size * scale)
-                rc = target_page.insert_textbox(
-                    fit_rect,
-                    trans_text,
-                    fontname="china-s",
-                    fontsize=try_size,
-                    color=orig_color,
-                    align=align
-                )
-                if rc >= 0:
-                    inserted = True
-                    break
-
-            if not inserted:
-                rc2 = target_page.insert_textbox(
-                    fit_rect,
-                    trans_text,
-                    fontname="china-s",
-                    fontsize=max(8.5, orig_size * 0.75),
-                    color=orig_color,
-                    align=align
-                )
-                if rc2 < 0:
-                    # 保底机制：当文本框高度极小导致 insert_textbox 溢出静默丢弃时，使用 insert_text 绝对写入
+                # 字号缩至单元格高度的 70%，多行时再缩减
+                cell_fs = max(7.5, min(orig_size, fit_rect.height * 0.7))
+                inserted = False
+                for fs_scale in [1.0, 0.85, 0.75, 0.65]:
+                    try_size = max(7.0, cell_fs * fs_scale)
+                    rc = target_page.insert_textbox(
+                        fit_rect, raw_text,
+                        fontname="china-s", fontsize=try_size,
+                        color=orig_color, align=1
+                    )
+                    if rc >= 0:
+                        inserted = True
+                        break
+                if not inserted:
+                    # 保底：insert_text 单行写入
                     target_page.insert_text(
-                        fitz.Point(fit_rect.x0, min(page_h - 4.0, fit_rect.y0 + max(8.0, orig_size * 0.75) * 0.85)),
-                        trans_text,
-                        fontname="china-s",
-                        fontsize=max(8.0, orig_size * 0.75),
+                        fitz.Point(fit_rect.x0, fit_rect.y0 + min(fit_rect.height * 0.65, 14.0)),
+                        raw_text[:20],  # 单元格空间过小时截断
+                        fontname="china-s", fontsize=max(7.0, cell_fs * 0.65),
                         color=orig_color
                     )
+
+            else:
+                # 普通文本块（标题 / 正文段落）
+                line_count = max(1, raw_text.count("\n") + 1)
+                is_short_label = orig_rect.width < 140.0 and line_count == 1
+
+                if is_short_label:
+                    # 短标签/节点名称：居中对齐，左右适度留出边距
+                    pad_w = max(4.0, orig_rect.width * 0.15)
+                    fit_rect = fitz.Rect(
+                        max(0, orig_rect.x0 - pad_w),
+                        orig_rect.y0,
+                        min(page_w, orig_rect.x1 + pad_w),
+                        min(page_h, orig_rect.y1 + 2.0)
+                    )
+                    align = 1  # 居中对齐
+                else:
+                    # 段落文本：高度保证至少容纳全部行数（CJK 行高约 1.4 倍字号）
+                    fit_w = min(page_w - orig_rect.x0 - 8.0, max(orig_rect.width * 1.1, 80.0))
+                    line_h = orig_size * 1.45
+                    # 高度 = max(原文高度, 行数 * 行高) + 10% buffer，保底不过页
+                    fit_h = max(orig_rect.height, line_count * line_h) * 1.1
+                    fit_rect = fitz.Rect(
+                        orig_rect.x0,
+                        orig_rect.y0,
+                        orig_rect.x0 + fit_w,
+                        min(page_h - 6.0, orig_rect.y0 + fit_h)
+                    )
+                    align = 0  # 左对齐
+
+                # 字号微调：从原字号 100% 递减，保底不低于 9.5pt 保证清晰可读
+                inserted = False
+                for scale in [1.0, 0.95, 0.90, 0.85, 0.80]:
+                    try_size = max(9.5, orig_size * scale)
+                    rc = target_page.insert_textbox(
+                        fit_rect, raw_text,
+                        fontname="china-s", fontsize=try_size,
+                        color=orig_color, align=align
+                    )
+                    if rc >= 0:
+                        inserted = True
+                        break
+
+                if not inserted:
+                    rc2 = target_page.insert_textbox(
+                        fit_rect, raw_text,
+                        fontname="china-s", fontsize=max(8.5, orig_size * 0.75),
+                        color=orig_color, align=align
+                    )
+                    if rc2 < 0:
+                        # 保底机制：使用 insert_text 绝对写入，防止文字静默丢失
+                        target_page.insert_text(
+                            fitz.Point(fit_rect.x0, min(page_h - 4.0, fit_rect.y0 + max(8.0, orig_size * 0.75) * 0.85)),
+                            raw_text,
+                            fontname="china-s", fontsize=max(8.0, orig_size * 0.75),
+                            color=orig_color
+                        )
+
+
 
     async def _vision_detect_and_translate_page(
         self,
