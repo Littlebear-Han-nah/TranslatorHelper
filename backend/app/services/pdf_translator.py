@@ -128,6 +128,7 @@ class PDFTranslator:
             block_text = ""
             spans_sizes: List[float] = []
             spans_colors: List[tuple] = []
+            text_x1 = b_rect.x0  # 追踪 span 实际最右位置
 
             for line in b.get("lines", []):
                 for span in line.get("spans", []):
@@ -140,6 +141,10 @@ class PDFTranslator:
                         g = ((c >> 8) & 255) / 255.0
                         b_col = (c & 255) / 255.0
                         spans_colors.append((r, g, b_col))
+                        # 记录 span 实际占用的最右 x1
+                        sp_bbox = span.get("bbox")
+                        if sp_bbox:
+                            text_x1 = max(text_x1, sp_bbox[2])
                 block_text += "\n"
 
             clean_text = block_text.strip()
@@ -155,6 +160,7 @@ class PDFTranslator:
                 "size": dom_size,
                 "color": dom_color,
                 "is_table_cell": False,
+                "text_x1": text_x1,  # 实际文字最右 x1（区别于 block bbox x1）
             })
 
         return extracted_blocks
@@ -208,16 +214,23 @@ class PDFTranslator:
     def _pick_font(text: str) -> str:
         """
         根据文本内容自动选择渲染字体：
-        - 以中文为主（CJK ≥ 30%）→ 'china-s'（内置简体中文字体）
-        - 以拉丁/英文为主（缩写、英文段落）→ 'helv'（Helvetica，正确字距）
-        使用 helv 可彻底消除 china-s 把英文字母当全角渲染导致字距拉大的问题。
+        - 以中文为主（CJK ≥ 60%）→ 'china-s'（内置简体中文字体）
+        - 英文/缩写为主 → 'helv'（Helvetica，正确拉丁字距）
+        注意：若文本中含有连续大写字母序列（英文缩写，如 JAVA/API），
+        即使中文较多也倾向于用 helv，避免缩写字母间距全角拉大。
         """
+        import re as _re
         cjk = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
         latin = sum(1 for c in text if c.isascii() and c.isalpha())
         total = cjk + latin
         if total == 0:
             return "china-s"
-        return "china-s" if cjk / total >= 0.3 else "helv"
+        # 若存在连续 2+ 大写字母（英文缩写），且 CJK 比例不够高，使用 helv
+        has_acronym = bool(_re.search(r'[A-Z]{2,}', text))
+        cjk_ratio = cjk / total
+        if has_acronym and cjk_ratio < 0.75:
+            return "helv"
+        return "china-s" if cjk_ratio >= 0.6 else "helv"
 
     def _apply_in_place_translations(
         self,
@@ -335,14 +348,15 @@ class PDFTranslator:
                     )
                     align = 1
                 else:
-                    # 宽度严格使用原文块右边界，绝不横向扩展（防止溢出进入图片区域）
-                    # 高度按实际翻译行数 × CJK 行高估算，允许垂直扩展
+                    # 宽度：使用 span 级实际文字最右 x1（非 block bbox x1），避免 PPT 宽 bbox 导致中文不换行
+                    # 高度：按实际翻译行数 × CJK 行高估算，允许垂直扩展
+                    text_right = blk.get("text_x1", orig_rect.x1)
                     line_h = orig_size * 1.45
                     fit_h = max(orig_rect.height, line_count * line_h) * 1.05
                     fit_rect = fitz.Rect(
                         orig_rect.x0,
                         orig_rect.y0,
-                        orig_rect.x1,          # 严格用原文 x1，不扩展
+                        text_right,           # span 实际最右边界，不超出文字列宽
                         min(page_h - 6.0, orig_rect.y0 + fit_h)
                     )
                     # 图片避让：如果文字框右侧超入图像区域，收窄 fit_rect.x1
