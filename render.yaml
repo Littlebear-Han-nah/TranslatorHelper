@@ -1,17 +1,26 @@
-# ==============================================================================
-# Render 官方一键部署蓝图配置 (Blueprint)
-# 用户将仓库连接到 Render 后，Render 会自动识别本文件并全自动部署
-# ==============================================================================
 services:
   - type: web
-    name: bilingual-doc-translator
-    env: docker
-    plan: free
+    name: translatorhelper-v2
+    runtime: docker
+    plan: 1c-2g
     branch: main
-    autoDeploy: true
+    autoDeploy: false
     dockerfilePath: ./Dockerfile
-    healthCheckPath: /api/config
+    healthCheckPath: /api/health
     envVars:
       - key: DASHSCOPE_API_KEY
-        value: "sk-ws-H.PDDLLRH.BX6X.MEYCIQC44Nz2sYrwmcqIXL_2A0F4qNyajfPZ6R6_un8C3ELvLAIhAPIZX7JmML8t_m1rRe1U72JV2dAtfsaE6bRiCT6tNzUq"
         sync: false
+      - key: DASHSCOPE_BASE_URL
+        value: https://ws-z35kkg3gacz2xk3g.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+      - key: DEFAULT_MODEL
+        value: qwen3.7-flash
+      - key: APP_ACCESS_TOKEN
+        generateValue: true
+      - key: DATA_DIR
+        value: /app/data
+      - key: MAX_PAGES
+        value: '200'
+    disk:
+      name: translator-documents
+      mountPath: /app/data
+      sizeGB: 5

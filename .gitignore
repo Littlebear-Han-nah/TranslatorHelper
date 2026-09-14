@@ -18,3 +18,12 @@ outputs/*
 .idea/
 .vscode/
 *.log
+
+# Server secrets and private document data
+.env
+.env.*
+!.env.example
+data/
+.pytest_cache/
+frontend/dist/
+artifacts/

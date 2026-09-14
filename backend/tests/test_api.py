@@ -1,0 +1,58 @@
+import hashlib
+import io
+import secrets
+from fastapi.testclient import TestClient
+import pymupdf as fitz
+import pytest
+from backend.app import main, store
+
+@pytest.fixture
+def api(tmp_path,monkeypatch):
+    monkeypatch.setattr(store,'DB_PATH',tmp_path/'test.sqlite3')
+    monkeypatch.setattr(main,'UPLOAD_DIR',tmp_path)
+    monkeypatch.setattr(main,'APP_ACCESS_TOKEN','')
+    with TestClient(main.app) as client:
+        client.get('/api/config')
+        yield client
+
+def test_upload_hides_paths_and_checks_content(api):
+    response=api.post('/api/files',files={'file':('../../secret.pdf',b'not a pdf','application/pdf')})
+    assert response.status_code==400
+    doc=fitz.open();doc.new_page();content=doc.tobytes();doc.close()
+    response=api.post('/api/files',files={'file':('../../paper.pdf',content,'application/pdf')})
+    assert response.status_code==201
+    assert response.json()['filename']=='paper.pdf'
+    assert 'saved_path' not in response.json()
+
+def test_sessions_cannot_access_other_tasks(api):
+    session=api.cookies.get('translator_session');owner=hashlib.sha256(session.encode()).hexdigest()
+    task={'task_id':'a'*32,'stage':'completed','filename':'private.pdf','result':None}
+    store.put_task(task,owner)
+    assert api.get('/api/tasks/'+'a'*32).status_code==200
+    api.cookies.clear();api.get('/api/config')
+    assert api.get('/api/tasks/'+'a'*32).status_code==404
+    assert api.get('/api/tasks').json()==[]
+
+def test_access_token_and_config_never_reveal_key(api,monkeypatch):
+    monkeypatch.setattr(main,'APP_ACCESS_TOKEN','test-access-only')
+    monkeypatch.setattr(main,'DEFAULT_API_KEY','test-key-only')
+    response=api.get('/api/config')
+    assert 'test-key-only' not in response.text
+    assert not response.json()['authorized']
+    assert api.get('/api/tasks').status_code==401
+    assert api.post('/api/session',json={'token':'wrong'}).status_code==401
+    assert api.post('/api/session',json={'token':'test-access-only'}).status_code==200
+    assert api.get('/api/tasks').status_code==200
+
+def test_cancel_is_terminal_and_restart_preserves_completed(api):
+    user=hashlib.sha256(api.cookies.get('translator_session').encode()).hexdigest()
+    store.put_task({'task_id':'b'*32,'stage':'translating','filename':'p.pdf'},user)
+    assert api.post('/api/tasks/'+'b'*32+'/cancel').json()['stage']=='cancelled'
+    store.update('b'*32,stage='completed',message='late worker update')
+    assert store.get_task('b'*32)['stage']=='cancelled'
+    store.initialize()
+    assert store.get_task('b'*32)['stage']=='cancelled'
+
+def test_client_cannot_supply_arbitrary_filesystem_path(api):
+    response=api.post('/api/tasks',json={'file_id':'../../etc/passwd','model':'test','saved_path':'/etc/passwd'})
+    assert response.status_code==422

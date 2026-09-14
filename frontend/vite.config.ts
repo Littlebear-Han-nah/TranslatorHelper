@@ -1,5 +1,5 @@
-import { defineConfig } from 'vite';
-import react from '@vitejs/plugin-react';
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
 
 // Vite 配置文件：配置 React 插件与后端 API 代理
 export default defineConfig({
@@ -7,12 +7,12 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': {
-        target: 'http://127.0.0.1:8000',
+      "/api": {
+        target: "http://127.0.0.1:8010",
         changeOrigin: true,
       },
-      '/outputs': {
-        target: 'http://127.0.0.1:8000',
+      "/outputs": {
+        target: "http://127.0.0.1:8010",
         changeOrigin: true,
       },
     },

@@ -1,154 +1,89 @@
-# 课件/论文智能双语对照翻译系统 (Bilingual Doc Translator)
+# 译页 · TranslatorHelper 2.0
 
-基于**通义千问大模型（DashScope API）**驱动的专业级课件与学术论文双语对照翻译系统。支持 **PDF 课件/论文、Word (`.docx`)、Markdown (`.md`) 以及图片/图表截图**，核心功能是自动生成**“左边是原版、右边是中文”**的高清无损对照 PDF 文件，并在 Web 网页端提供左右双栏同步滚动精读与一键下载。
+AI 文档翻译与中英双栏阅读工作台。基于已有 React / Vite + FastAPI 项目重构，支持 PDF、PNG、JPG/JPEG、DOCX、PPTX、XLSX。默认使用千炼 OpenAI 兼容接口，提供 Qwen、Kimi、DeepSeek、GLM 八个预设模型和自定义模型 ID。
 
----
+## 本地运行
 
-## 🌟 核心特性
-
-1. **多格式输入全面支持**：
-   - **PDF 课件与学术论文**：智能提取页面版面与文本，支持 16:9 横版幻灯片及 A4 纵版学术论文；
-   - **Word 文档 (`.docx`)**：自动解析并生成左右双栏表格对照排版的 Word 与对照 PDF；
-   - **Markdown 笔记 (`.md`)**：智能保护代码块、标头与列表，输出双语对照 Markdown 与 PDF；
-   - **图片与论文截图**：支持 PNG、JPG、WEBP 格式，结合通义千问多模态/OCR 能力生成左右拼接大图与 PDF。
-
-2. **核心输出：左原版 · 右中文对照 PDF**：
-   - 采用 PyMuPDF 高性能矢量画板技术，横向拓展为双倍画布宽度（$2W \times H$）；
-   - 左侧保留原始版面矢量图层，右侧呈现专业排版的学术中文，中间嵌入优雅分割线；
-   - 生成的 PDF 在任何阅读器（iPad、Mac Preview、Acrobat）或打印时天然呈现左右对照。
-
-3. **学术与课件专业 Prompt 调优**：
-   - **LaTeX 数学公式保护**：内联公式 `$..$` 与块级公式 `$$..$$` 绝对保留，不发生乱码；
-   - **学术规范文风**：专为国际学术论文打造严谨学术文风，完整保留文献引用标记（如 `[1]`, `[2-4]`）与图表标号；
-   - **课件幻灯片模式**：语言简明扼要，保留项目列表层级与关键代码。
-
-4. **Web 端双栏交互式阅读器**：
-   - 网页端实时同步渲染左右高保真缩略图，支持逐页跳转、80%~180% 缩放；
-   - 支持“高保真排版对照”与“双语文本精读”双视图自由切换；
-   - 一键复制单页中文翻译内容。
-
-5. **全流程文件导出中心**：
-   - 📥 **下载左右并排对照 PDF**（左原版、右中文，满足最核心需求）；
-   - 📥 **下载纯中文翻译版 PDF**；
-   - 📥 **下载双语 Word / Markdown 源码文件**。
-
----
-
-## 🛠️ 支持的模型清单
-
-系统已内置以下高性能模型，用户可在 Web 页面顶部下拉框随意切换：
-
-| 模型名称 | 标识符 | 适用场景 |
-| :--- | :--- | :--- |
-| **通义千问 3.8 Flash (推荐)** | `qwen3.8-flash` | 极速响应，学术翻译质量与速度兼备 |
-| **通义千问 3.8 Max** | `qwen3.8-max` | 深度学术翻译、长难句与顶刊论文精翻 |
-| **通义千问 3.8 Max (0902)** | `qwen3.8-max-0902` | 最新学术增强版本 |
-| **通义千问 3.5 OCR** | `qwen3.5-ocr` | 图片/扫描件/公式图表专用视觉多模态识别与翻译 |
-| **通义千问 3.8 27B** | `qwen3.8-27b` | 均衡平衡型模型 |
-| **通义千问 3.7 Flash** | `qwen3.7-flash` | 轻量级稳定模型 |
-| **Kimi K3 / K2.7 Code** | `kimi-k3` / `kimi-k2.7-code` | 超长文本理解与编程代码课件翻译 |
-| **DeepSeek V4 系列** | `deepseek-v4-flash-0731` / `deepseek-v4-pro-0813` | 极速推理与深度逻辑分析 |
-| **GLM 5.2** | `glm-5.2` | 智谱旗舰综合模型 |
-
----
-
-## 🚀 极速启动与使用指南
-
-### 方式一：一键脚本启动（最简便）
-
-在项目根目录下直接运行启动脚本：
+需要 Node.js 20+、Python 3.13、Tesseract（英文 OCR）及 LibreOffice（Office 转 PDF）。
 
 ```bash
-./run.sh
-```
-
-脚本将自动定位 Python 环境、检查前端构建、启动 Web 服务并在浏览器中自动打开：
-👉 **http://127.0.0.1:8000**
-
----
-
-### 方式二：Python 跨平台启动
-
-```bash
-/opt/anaconda3/bin/python3 start.py
-```
-
----
-
-### 方式三：云端免费部署（免本地电脑开机，随时随地可用）
-
-如果您希望将网站托管在公网上（无需本地电脑开机运行），可直接部署到 **Render** 免费云平台：
-- 项目已内置 `Dockerfile`、`render.yaml` 自动化部署配置；
-- 详细部署图文教程请查阅：👉 **[DEPLOY_RENDER.md](file:///Users/xiongwenhan/Documents/antigravity/splendid-galileo/DEPLOY_RENDER.md)**。
-
----
-
-### 方式三：前后端分离开发模式
-
-**1. 启动后端**：
-```bash
-/opt/anaconda3/bin/python3 -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-**2. 启动前端热重载开发服务器**：
-```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+cp .env.example .env
+# 在 .env 填入 DASHSCOPE_API_KEY；不要提交 .env
 cd frontend
-npm run dev
+npm ci
+npm run build
+cd ..
+.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8010
 ```
-访问：`http://localhost:5173`（API 请求自动代理到 8000 端口）。
 
----
+打开 http://127.0.0.1:8010 。开发时另外运行 `cd frontend && npm run dev`，打开 http://127.0.0.1:5173 ，API 代理到 8010。
 
-## 📖 使用操作步骤
+macOS 系统依赖：`brew install tesseract` 和 `brew install --cask libreoffice`。Docker 镜像已经包含系统依赖和中文字体。也可用 `LIBREOFFICE_BIN` 指定转换程序路径。
 
-1. **配置 API Key**：
-   - 打开网页后，点击右上角 **“配置 API 密钥”** 按钮；
-   - 系统已为您预填您的专属密钥，您也可随时修改，并点击 **“测试连通性”** 实时校验。
-2. **选择模式与模型**：
-   - 选择 **“课件模式 (Slides)”** 或 **“学术论文 (Paper)”**；
-   - 选择推荐的 `qwen3.8-flash`（日常翻译）或 `qwen3.8-max`（高质量精翻）。
-3. **上传文档**：
-   - 将您的英文课件 PDF、学术论文 PDF、Word 讲义、Markdown 笔记或图片拖入网页虚线区域。
-4. **一键翻译与实时预览**：
-   - 点击 **“开始生成左右对照 PDF”**；
-   - 界面实时显示逐页翻译进度条与日志；
-   - 翻译完成后，在网页下方的 **双栏阅读器** 中直接翻页、缩放对照阅读。
-5. **下载生成文件**：
-   - 点击顶部绿色条中的 **“下载左右并排对照 PDF”**，即可将合并好的左原版右中文 PDF 保存到本地！
+## 翻译与重建流程
 
----
-
-## 📂 项目工程结构
-
+```mermaid
+flowchart LR
+    A[上传与内容校验] --> B[私有文件存储 / SQLite 任务]
+    B --> C{文件类型}
+    C -->|PDF / 图片| D[文字坐标 / 表格单元格 / Tesseract OCR]
+    C -->|Office| E[原 OOXML 文字节点翻译]
+    E --> F[原格式译文]
+    E --> G[LibreOffice 转换原文 PDF]
+    G --> D
+    D --> H[区域 ID / 样式 / 公式保护]
+    H --> I[统一 Model Adapter / 术语表 / 分批翻译]
+    I --> J[HTML 排版预检]
+    J --> K[通过: 原位替换 / 未通过: 保留原文并标记]
+    K --> L[中文 PDF / 对照 PDF / 逐页预览 / 质量报告]
 ```
-.
-├── backend/                        # 后端核心源码
-│   ├── app/
-│   │   ├── main.py                 # FastAPI 路由、SSE 事件流与静态托管
-│   │   ├── config.py               # 默认配置、模型列表与存储路径
-│   │   ├── services/
-│   │   │   ├── qwen_client.py      # 通义千问客户端（防代理阻断直连引擎）
-│   │   │   ├── pdf_translator.py   # PDF 提取、排版与“左原版-右中文”并排拼接核心算法
-│   │   │   ├── docx_translator.py  # Word 文档双栏对照翻译引擎
-│   │   │   ├── md_translator.py    # Markdown 文档对照翻译引擎
-│   │   │   └── image_translator.py # 图片 OCR 识别与并排拼接引擎
-│   │   └── utils/
-│   │       └── font_helper.py      # CJK 中文字体智能加载与兼容
-│   └── test_pipeline.py            # 端到端自动化全流程测试脚本
-├── frontend/                       # React 18 + Vite + Tailwind 前端工程
-│   ├── src/
-│   │   ├── App.tsx                 # 前端主应用视图
-│   │   ├── components/
-│   │   │   ├── Header.tsx          # 顶部导航、模型切换与模式选择
-│   │   │   ├── ApiKeyModal.tsx     # 密钥设置与连通性测试模态窗
-│   │   │   ├── FileUploader.tsx    # 现代化多格式拖拽上传组件
-│   │   │   ├── TaskProgress.tsx    # 动态流水线进度条与状态展示
-│   │   │   ├── SplitViewReader.tsx # 左右双栏交互式同步阅读器
-│   │   │   └── ExportBar.tsx       # 左右并排 PDF 与各类格式一键下载栏
-│   │   └── types.ts                # TypeScript 类型定义
-│   └── dist/                       # 前端生产打包产物
-├── uploads/                        # 用户上传文档暂存目录
-├── outputs/                        # 生成的双语对照 PDF 及预览图存放目录
-├── run.sh                          # macOS / Linux 一键启动脚本
-└── start.py                        # Python 跨平台启动器
+
+- **数字 PDF**：以原 PDF 为底稿，提取文字坐标、字号、颜色和样式，识别表格单元格。只删除成功通过排版预检的文字字形，保留底层图片和矢量线条；不扩张擦除框，不截断译文，不强制写出页面边界。
+- **公式和复杂文字**：数学字体、部分符号、上标、代码、旋转文字区域保留原样。含英文的受保护区域仍提供文本译文。LaTeX、引用和 URL 使用占位符保护，模型破坏标记时中止该任务。
+- **OCR**：使用 Tesseract 的实际像素坐标识别英文，文本模型仅负责翻译。扫描件和平色背景图片可进行原位覆盖；低置信度、复杂背景和重叠区域保留原图并提示复核。混合 PDF 对大幅图片区域补充 OCR。
+- **排版预检**：在临时页面试排完整译文，字号不低于原字号的 65% 或 6pt（取较大者，原字号不足 6pt 时不再缩小）。原区域放不下时保留原文，完整译文保存在文本精读和质量报告中。
+- **Word / PPT / Excel**：直接改写 ZIP 内 XML 的文字节点，保留段落和文字样式节点、图片、公式 XML、表格、合并单元格及关系文件。Excel 不修改数字和公式；与公式字符串常量相同的文字也保留，以减少破坏匹配条件。
+- **Office 页码对照**：LibreOffice 将原 Office 转成 PDF 后，以该 PDF 为基准原位翻译，保证左右 PDF 页数一致。原格式译文是另一份可编辑文件，可能被 Office 重新分页。缺少 LibreOffice 时仍输出原格式译文，界面明确说明没有 PDF 预览。
+
+## 模型与配置
+
+模型预设来自 `backend/app/config.py`，前端通过 `/api/config` 加载；用户可输入任意兼容模型 ID，也可通过 `MODEL_CATALOG_JSON` 替换整个目录。默认 `qwen3.7-flash`，可以用 `DEFAULT_MODEL` 更改。预设名称来源于项目需求，实际调用权限由服务商决定。
+
+`CompatibleAdapter` 对所有供应商使用相同协议，模型不会被静默替换。它进行有界批处理、精确区域 ID 校验、公式占位符校验、任务内缓存、有限重试和错误脱敏。术语表随每批请求发送。
+
+密钥只从服务端环境变量读取；网页、任务数据库、导出文件和日志均不保存密钥。`DASHSCOPE_BASE_URL` 只能在服务端配置，不接受浏览器传入任意地址。默认 `MODEL_TRUST_ENV=false`，使用标准 HTTPS 直连并校验证书；需要组织代理时设为 `true`。
+
+## 任务与文件
+
+- 文件最大 50 MB，默认最多 200 页，图片最多 4000 万像素；Office 解压总量有限制并拒绝宏及非超链接类型外部关系。
+- 上传文件名仅作展示；服务器生成文件 ID，客户端不能指定本地路径。
+- 浏览器使用 HttpOnly / SameSite 会话 Cookie；任务、原文图片、译文和下载均校验所属会话，不对外开放目录。
+- 公网部署设置 `APP_ACCESS_TOKEN`，在“模型设置”输入平台口令；口令与 API 密钥相互独立。
+- SQLite 持久化任务和状态，单进程单工作队列避免多个 LibreOffice 实例争抢内存；每会话最多 3 个活动任务，全局最多 12 个。
+- 取消在当前模型请求或转换步骤结束后生效，不保证终止已发送给服务商的请求。服务重启后未完成任务标记失败，可重新上传翻译；已完成任务保留。
+- 当前版本适合个人或小团队单实例部署。会话 Cookie 有效期 30 天，清除浏览器 Cookie 后无法访问旧会话记录。尚无账户体系、自动数据清理、分布式队列或跨设备历史同步；管理员需按自己的保留政策清理私有数据目录。
+
+## 质量边界
+
+这里的“无痕”是优先保留版面并提供可检查的降级结果，**不承诺所有复杂文档像素级一致或全文自动翻译成功**。
+
+数学和版面识别使用启发式规则，复杂行内公式可能需要复核。扫描背景修复针对平色区域，不提供任意照片背景修复。OCR 仅配置英文。页内图片里的文字不一定全部被识别。Office 的富文本按样式节点翻译，跨节点语序可能需要调整；SmartArt、图表缓存文字、嵌入对象和艺术字没有专门翻译支持。Excel 的动态公式引用与自定义函数仍应人工验算。
+
+导出的中文 PDF 保持页面几何和页数，字号、换行可能变化。质量报告记录每个区域的原文、译文、坐标、处理状态和保留原因，不给出未经测量的质量百分比。
+
+## 测试
+
+```bash
+.venv/bin/python -m pytest backend/tests -q
+cd frontend && npm run build
 ```
+
+测试验证：结构化模型响应、保护标记、溢出保留、PDF 图片与背景像素不变、Word 公式与样式、PPT 图片与位置、Excel 公式和合并、访问口令、会话隔离、路径安全及取消竞态。可运行 `.venv/bin/python backend/tests/make_fixtures.py` 生成六种格式的合成验收文件（保存在不提交的 `artifacts/fixtures/`）。测试不使用真实模型，真实服务联调需另行执行。
+
+## 部署
+
+见 [DEPLOY_RENDER.md](DEPLOY_RENDER.md)。整个应用用一个 Docker Web Service 部署，前端由 FastAPI 同域托管，避免跨域 Cookie 和双服务配置问题。
+
+实现参考：[PyMuPDF 页面排版与 redaction 文档](https://pymupdf.readthedocs.io/en/latest/page.html)、[Render Blueprint 配置](https://render.com/docs/blueprint-spec)。使用 PyMuPDF 时请按项目的实际发布方式核对其 AGPL / 商业许可证要求。
