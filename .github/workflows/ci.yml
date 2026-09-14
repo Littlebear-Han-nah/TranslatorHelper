@@ -25,3 +25,12 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci && npm run build
         working-directory: frontend
+  docker-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t translatorhelper:ci .
+      - name: Verify production document dependencies
+        run: >-
+          docker run --rm --entrypoint python translatorhelper:ci -c
+          "import shutil; import pymupdf; from backend.app.main import app; from backend.app.services.office_engine import office_binary; assert shutil.which('tesseract'); assert office_binary(); doc=pymupdf.open(); page=doc.new_page(); assert page.insert_htmlbox(pymupdf.Rect(20,20,300,100),'中文排版验证')[0]>=0; print('Production image dependencies and CJK rendering: OK')"
