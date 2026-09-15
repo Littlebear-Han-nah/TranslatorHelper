@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from PIL import Image, ImageOps, UnidentifiedImageError
 import pymupdf as fitz
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from . import store
 from .config import UPLOAD_DIR, OUTPUT_DIR, BASE_DIR, DEFAULT_API_KEY, DEFAULT_MODEL, SUPPORTED_MODELS, APP_ACCESS_TOKEN, MAX_UPLOAD_BYTES
 from .services.model_adapter import CompatibleAdapter, ModelError
@@ -31,9 +32,15 @@ TERMINAL = ('completed', 'failed', 'cancelled')
 async def lifespan(app):
     store.initialize()
     yield
-    # Running tasks are marked interrupted on the next startup.
+    # 运行中的任务在下一次重启时会被标记为中断
 
 app = FastAPI(title='译页 TranslatorHelper', version='2.0.0', lifespan=lifespan)
+# 添加反向代理中间件，正确处理 Render 等云平台的 X-Forwarded-Proto 与 X-Forwarded-For 协议头
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+
+def is_secure_request(request: Request) -> bool:
+    """判断请求是否处于 HTTPS 保护之下（兼容反向代理头）。"""
+    return request.url.scheme == 'https' or request.headers.get('x-forwarded-proto') == 'https'
 
 def owner(request: Request):
     value = request.cookies.get('translator_session', '')
@@ -56,7 +63,15 @@ def health(): return {'status': 'ok', 'version': '2.0.0'}
 @app.get('/api/config')
 def config(request: Request, response: Response):
     if not re.fullmatch(r'[a-f0-9]{64}', request.cookies.get('translator_session', '')):
-        response.set_cookie('translator_session', secrets.token_hex(32), httponly=True, secure=request.url.scheme == 'https', samesite='strict', max_age=60*60*24*30)
+        # 将 samesite 设置为 lax，确保下载及跳转时 Cookie 能稳定携带，同时防范 CSRF
+        response.set_cookie(
+            'translator_session',
+            secrets.token_hex(32),
+            httponly=True,
+            secure=is_secure_request(request),
+            samesite='lax',
+            max_age=60*60*24*30
+        )
     response.headers['Cache-Control'] = 'no-store'
     return {'models': SUPPORTED_MODELS, 'default_model': DEFAULT_MODEL, 'has_default_key': bool(DEFAULT_API_KEY), 'authorized': authorized(request), 'ocr_available': bool(shutil.which('tesseract')), 'office_preview_available': bool(office_binary()), 'max_upload_mb': 50}
 
@@ -68,7 +83,14 @@ def login(body: Login, request: Request, response: Response):
     if APP_ACCESS_TOKEN and not hmac.compare_digest(body.token.encode(), APP_ACCESS_TOKEN.encode()):
         raise HTTPException(401, '访问口令不正确')
     signed = hmac.new(APP_ACCESS_TOKEN.encode(), request.cookies['translator_session'].encode(), hashlib.sha256).hexdigest()
-    response.set_cookie('translator_access', signed, httponly=True, secure=request.url.scheme == 'https', samesite='strict', max_age=86400)
+    response.set_cookie(
+        'translator_access',
+        signed,
+        httponly=True,
+        secure=is_secure_request(request),
+        samesite='lax',
+        max_age=86400
+    )
     return {'ok': True}
 
 class ModelRequest(BaseModel): model: str = Field(min_length=1, max_length=120, pattern=r'^[A-Za-z0-9_.:/-]+$')

@@ -882,18 +882,40 @@ h1 em {
   gap: 12px;
   flex-wrap: wrap;
 }
-.exports a {
+.exports a,
+.exports button {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   border: 1px solid #dfe6d8;
-  border-radius: 5px;
-  padding: 8px 11px;
-  font-size: 10px;
-  color: #587b52;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 11px;
+  color: #3b5a35;
+  background: #fbfdf9;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-family: inherit;
 }
-.exports a:hover {
+.exports a:hover,
+.exports button:hover:not(:disabled) {
   background: #edf4e7;
+  border-color: #bcd1b5;
+}
+.exports button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+.exports button.highlight {
+  background: #587b52;
+  color: #ffffff;
+  border-color: #587b52;
+  font-weight: 500;
+  box-shadow: 0 1px 3px rgba(88, 123, 82, 0.2);
+}
+.exports button.highlight:hover:not(:disabled) {
+  background: #466541;
+  border-color: #466541;
 }
 .exports details {
   width: 100%;

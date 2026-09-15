@@ -19,4 +19,5 @@ RUN useradd --create-home --uid 10001 translator && mkdir -p /app/data && chown 
 USER translator
 ENV PORT=8000 PYTHONUNBUFFERED=1 DATA_DIR=/app/data
 EXPOSE 8000
-CMD ["sh", "-c", "python -m uvicorn backend.app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
+CMD ["sh", "-c", "python -m uvicorn backend.app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --proxy-headers --forwarded-allow-ips='*'"]
+

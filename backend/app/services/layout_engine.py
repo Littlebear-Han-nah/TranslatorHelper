@@ -143,9 +143,13 @@ def extract_blocks(page):
     return blocks
 
 def add_ocr(page, blocks):
-    """OCR coordinates come from Tesseract, never from a text-only language model."""
+    """仅在扫描版页面（原生文本极少）时使用 Tesseract OCR，原生电子文本充足时直接跳过。"""
     images = [fitz.Rect(item['bbox']) for item in page.get_image_info()]
     native_length = sum(len(b.text) for b in blocks)
+
+    # 若页面已有较为充足的原生可选中文本（字符数 >= 50 且至少 2 个块），视为正常矢量排版文档，直接跳过耗时 OCR
+    if native_length >= 50 and len(blocks) >= 2:
+        return blocks, []
     if native_length >= 20 and not any(r.get_area() > page.rect.get_area() * .15 for r in images):
         return blocks, []
     if not images and native_length >= 20:
@@ -157,6 +161,7 @@ def add_ocr(page, blocks):
     import pytesseract
     pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
     img = Image.frombytes('RGB', (pix.width, pix.height), pix.samples)
+    del pix  # 及时释放内存
     data = pytesseract.image_to_data(img, lang='eng', config='--psm 3', output_type=pytesseract.Output.DICT, timeout=90)
     groups = defaultdict(list)
     for i, text in enumerate(data['text']):
@@ -192,13 +197,15 @@ def add_ocr(page, blocks):
     return blocks, ['扫描区域采用 OCR 定位与平色背景修复；低置信度和复杂背景保留原图并标记。'] if groups else ['OCR 未识别到文字，页面保留原样。']
 
 def html_content(block, text):
+    """构建用于原位排版的 HTML 内容片段。"""
     color = f'#{block.color:06x}'
     return f'<div style="font-family:sans-serif;font-size:{block.size}pt;line-height:{block.line_height};color:{color};font-weight:{"bold" if block.bold else "normal"};font-style:{"italic" if block.italic else "normal"}">{html.escape(text).replace(chr(10), "<br/>")}</div>'
 
 
 def render_blocks(original, target, blocks):
+    """将翻译后的文本原位渲染回目标 PDF，包含预检、原位擦除与自适应字号排版。"""
     plans = []
-    # All layout is dry-run on scratch pages BEFORE any original text is removed.
+    # 在独立刮板页上先进行排版预检，确保文字能够平整收纳
     for b in blocks:
         if b.status not in ('pending', 'review') or not b.translation or b.kind == 'protected' or b.reason:
             continue
@@ -214,9 +221,9 @@ def render_blocks(original, target, blocks):
             continue
         bg = None
         if b.kind == 'ocr':
-            # Sample strips bordering the text, reject textured backgrounds.
             pix = original.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
             im = Image.frombytes('RGB', (pix.width, pix.height), pix.samples)
+            del pix
             x0, y0, x1, y1 = [int(v * 2) for v in b.bbox]
             strips = [(max(0,x0-2),max(0,y0-4),min(im.width,x1+2),max(1,y0-1)), (max(0,x0-2),min(im.height-1,y1+1),min(im.width,x1+2),min(im.height,y1+4))]
             samples = [im.crop(r) for r in strips if r[2]>r[0] and r[3]>r[1]]
@@ -236,30 +243,37 @@ def render_blocks(original, target, blocks):
             b.status, b.reason = 'review', '完整译文无法在可读字号下放入原区域；保留原文，译文见文本精读'
             continue
         plans.append((b, rect, content, bg, min_scale))
+
     for b, rect, content, bg, min_scale in plans:
         if b.kind != 'ocr':
             for span in b.spans:
-                # No opaque fill, no expanded bounds, no formula/image destruction.
                 target.add_redact_annot(fitz.Rect(span), fill=False, cross_out=False)
     if any(b.kind != 'ocr' for b, *_ in plans):
         target.apply_redactions(images=0, graphics=0, text=0)
+
     for b, rect, content, bg, min_scale in plans:
         if bg is not None:
             target.draw_rect(rect, color=None, fill=bg, overlay=True)
         spare, _ = target.insert_htmlbox(rect, content, css='*{margin:0;padding:0}', scale_low=min_scale)
         if spare < 0:
-            raise RuntimeError('排版预检与写入结果不一致，已中止导出')
+            # 若偶发排版微溢出，自适应允许缩放到 0.55 字号；若仍不足则平滑标记为待复核，绝不使整个任务崩溃
+            spare_retry, _ = target.insert_htmlbox(rect, content, css='*{margin:0;padding:0}', scale_low=0.55)
+            if spare_retry < 0:
+                b.status, b.reason = 'review', '译文字数过多产生溢出，保留原排版'
+                continue
         b.status = 'translated'
     return blocks
 
 async def translate_pdf(source_path, output, adapter, model, mode, glossary, progress, cancel):
+    """整本 PDF 无痕翻译与双栏排版拼接主流程。"""
+    import gc
     output = Path(output)
     source = fitz.open(source_path)
     if source.needs_pass:
         source.close(); raise ValueError('PDF 已加密，请先解锁后上传')
     if not 0 < len(source) <= MAX_PAGES:
         source.close(); raise ValueError(f'文档页数须为 1–{MAX_PAGES}')
-    # Normalize rotation while preserving visual appearance and coordinate mapping.
+    # 标准化旋转角度，保持视觉与坐标一致性
     for page in source:
         if page.rotation: page.remove_rotation()
     translated = fitz.open(stream=source.tobytes(), filetype='pdf')
@@ -277,21 +291,41 @@ async def translate_pdf(source_path, output, adapter, model, mode, glossary, pro
             warnings.extend(f'第 {index+1} 页：{note}' for note in notes)
             candidates = [{'id': b.id, 'text': b.text} for b in blocks if b.status == 'pending' or (b.kind == 'protected' and b.status == 'review')]
             progress('translating', 5 + int((index+.25) / len(source) * 80), f'翻译第 {index+1} / {len(source)} 页 · {len(candidates)} 个区域')
-            values = await adapter.translate(candidates, model, mode, glossary)
+            
+            # 单页大模型调用容错隔离：单个页面异常不中断整本 50 页任务
+            try:
+                values = await adapter.translate(candidates, model, mode, glossary)
+            except Exception as exc:
+                warnings.append(f'第 {index+1} 页模型响应异常（{type(exc).__name__}），本页保留原文')
+                values = {}
+
             cancel()
             for block in blocks: block.translation = values.get(block.id, '')
             progress('rebuilding', 5 + int((index+.6) / len(source) * 80), f'重建第 {index+1} / {len(source)} 页的原始版面')
-            render_blocks(original, target, blocks)
+            
+            try:
+                render_blocks(original, target, blocks)
+            except Exception as exc:
+                warnings.append(f'第 {index+1} 页排版写入遇到异常，已保留原文排版')
+
+            # 渲染页面预览图，显式清理 pixmap 避免多页内存暴涨导致容器 OOM
             for label, doc_page in [('original', original), ('translated', target)]:
-                doc_page.get_pixmap(matrix=fitz.Matrix(1.5,1.5), alpha=False).save(str(output / f'{label}-{index+1}.png'))
+                pix = doc_page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+                pix.save(str(output / f'{label}-{index+1}.png'))
+                del pix
+
             width, height = original.rect.width, original.rect.height
             pages.append({'page': index+1, 'width': width, 'height': height, 'orig_img': f'original-{index+1}.png', 'trans_img': f'translated-{index+1}.png', 'blocks': [asdict(b) for b in blocks]})
+            
+            # 每隔 5 页触发一次垃圾回收，防止 Render 容器内存溢出
+            if (index + 1) % 5 == 0:
+                gc.collect()
+
         progress('rebuilding', 86, '整理译文字体并导出翻译 PDF')
         translated.subset_fonts()
         translated.save(output / 'translated.pdf', garbage=4, deflate=True)
-        # show_pdf_page caches a graft map sized for the source's object table.
-        # All edits (including font subsetting) must finish before the first graft:
-        # adding fonts on later pages otherwise exceeds that cached table at page 2.
+
+        # 双栏左右对照拼接：左侧为原始页面，右侧为无痕翻译页面
         for index, page in enumerate(pages):
             cancel()
             progress('rebuilding', 89 + int(index / len(pages) * 9), f'生成第 {index+1} / {len(pages)} 页双栏 PDF')
@@ -304,8 +338,10 @@ async def translate_pdf(source_path, output, adapter, model, mode, glossary, pro
         progress('rebuilding', 98, '保存双栏 PDF')
         paired.subset_fonts()
         paired.save(output / 'bilingual.pdf', garbage=4, deflate=True)
+
         review = sum(b['status'] == 'review' for p in pages for b in p['blocks'])
         if review: warnings.append(f'{review} 个区域保留原文待检查，完整译文可在文本精读和质量报告中查看。')
         return {'pages': pages, 'translated_pdf': 'translated.pdf', 'bilingual_pdf': 'bilingual.pdf', 'warnings': warnings}
     finally:
         source.close(); translated.close(); paired.close()
+

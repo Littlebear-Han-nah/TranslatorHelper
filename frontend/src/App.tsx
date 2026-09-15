@@ -160,7 +160,8 @@ export default function App() {
   });
   const [access, setAccess] = useState(""),
     [connected, setConnected] = useState(""),
-    [testing, setTesting] = useState(false);
+    [testing, setTesting] = useState(false),
+    [downloading, setDownloading] = useState<string | null>(null);
   const input = useRef<HTMLInputElement>(null),
     left = useRef<HTMLDivElement>(null),
     right = useRef<HTMLDivElement>(null),
@@ -209,6 +210,40 @@ export default function App() {
       controller.abort();
     };
   }, [task?.task_id, task?.stage]);
+
+  // 稳健文件下载：通过 fetch 获取 Blob，捕获后端详细错误提示，并命名为包含原文件名的友好名称
+  const handleDownload = async (url: string, label: string) => {
+    try {
+      setDownloading(label);
+      setError("");
+      const res = await fetch(url, { credentials: "same-origin" });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `下载失败 (HTTP ${res.status})`);
+      }
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      const stem = task?.filename ? task.filename.replace(/\.[^/.]+$/, "") : "文档";
+      const ext = url.split(".").pop()?.split("?")[0] || "pdf";
+      let suffix = "翻译";
+      if (label.includes("对照")) suffix = "双栏对照(左原件·右中文)";
+      else if (label.includes("无痕") || label.includes("中文")) suffix = "中文无痕";
+      else if (label.includes("原格式")) suffix = "原格式译文";
+      else if (label.includes("质量报告")) suffix = "质量报告";
+      a.download = `${stem}_${suffix}.${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 1500);
+    } catch (e: any) {
+      setError(e.message || "下载失败，请刷新页面或重试");
+    } finally {
+      setDownloading(null);
+    }
+  };
+
   function choose(f?: File) {
     if (!f) return;
     if (!/\.(pdf|png|jpe?g|docx|pptx|xlsx)$/i.test(f.name)) {
@@ -787,17 +822,31 @@ export default function App() {
               {result && (
                 <div className="exports">
                   {[
-                    [result.translated_pdf, "中文 PDF"],
-                    [result.bilingual_pdf, "对照 PDF"],
-                    [result.native_file, "原格式译文"],
-                    [result.report, "质量报告"],
+                    [result.bilingual_pdf, "双栏对照 PDF (左原件·右中文)", true],
+                    [result.translated_pdf, "中文无痕 PDF", false],
+                    [result.native_file, "原格式译文", false],
+                    [result.report, "质量报告", false],
                   ]
                     .filter(([url]) => url)
-                    .map(([url, label]) => (
-                      <a key={label} href={url} download>
-                        <Download size={14} />
-                        {label}
-                      </a>
+                    .map(([url, label, highlight]) => (
+                      <button
+                        key={label as string}
+                        type="button"
+                        className={`download-btn ${highlight ? "highlight" : ""}`}
+                        disabled={downloading === (label as string)}
+                        onClick={() =>
+                          handleDownload(url as string, label as string)
+                        }
+                      >
+                        {downloading === (label as string) ? (
+                          <Loader2 size={14} className="spin" />
+                        ) : (
+                          <Download size={14} />
+                        )}
+                        {downloading === (label as string)
+                          ? "下载中..."
+                          : (label as string)}
+                      </button>
                     ))}
                   {result.warnings.length > 0 && (
                     <details>
