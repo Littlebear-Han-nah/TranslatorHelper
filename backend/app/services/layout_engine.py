@@ -207,7 +207,8 @@ def render_blocks(original, target, blocks):
     plans = []
     # 在独立刮板页上先进行排版预检，确保文字能够平整收纳
     for b in blocks:
-        if b.status not in ('pending', 'review') or not b.translation or b.kind == 'protected' or b.reason:
+        # 如果未翻译或翻译内容为空，或者明确保留非英文，则跳过
+        if b.status not in ('pending', 'review') or not b.translation:
             continue
         if b.translation == b.text:
             b.status, b.reason = 'review', '模型返回与原文相同的文字，保留原样'
@@ -216,9 +217,22 @@ def render_blocks(original, target, blocks):
         if rect.is_empty or rect.width < 3 or rect.height < 3:
             b.status, b.reason = 'review', '区域尺寸无效'
             continue
-        if any(other.id != b.id and (rect & fitz.Rect(other.bbox)).get_area() > 1 for other in blocks):
+
+        # 重叠检测：只有当重叠面积超过较小块面积的 60% 时，才视为严重冲突，避免课件中相邻紧凑的文字框被误判跳过
+        is_heavily_overlapping = False
+        rect_area = rect.get_area()
+        for other in blocks:
+            if other.id != b.id and other.status in ('pending', 'review') and other.translation:
+                other_rect = fitz.Rect(other.bbox) & target.rect
+                overlap_area = (rect & other_rect).get_area()
+                min_area = min(rect_area, other_rect.get_area())
+                if min_area > 0 and (overlap_area / min_area) > 0.6:
+                    is_heavily_overlapping = True
+                    break
+        if is_heavily_overlapping:
             b.status, b.reason = 'review', '文字区域重叠，需人工检查'
             continue
+
         bg = None
         if b.kind == 'ocr':
             pix = original.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
@@ -234,15 +248,31 @@ def render_blocks(original, target, blocks):
             bg = tuple(sum(s.median[k] for s in stats)/len(stats)/255 for k in range(3))
             b.color = 0xffffff if sum(bg) < 1.5 else 0x20251f
             rect = fitz.Rect(rect.x0-1.5, rect.y0-1, rect.x1+1.5, rect.y1+1) & target.rect
+
         content = html_content(b, b.translation)
+
+        # 排版预检与自适应弹性缩放：
+        # 针对中文字形特点，先按常规字号测试；若微小溢出，自适应适度缩放并给予微小安全延伸
+        final_rect = rect
         with fitz.open() as probe:
             p = probe.new_page(width=target.rect.width, height=target.rect.height)
-            min_scale = min(1.0, max(.65, 6.0 / b.size))
+            min_scale = min(1.0, max(0.6, 6.0 / b.size))
             spare, scale = p.insert_htmlbox(rect, content, css='*{margin:0;padding:0}', scale_low=min_scale)
+            if spare < 0:
+                # 尝试更弹性的最小字号 (最低 0.48) 并给予垂直方向微小安全容差 (最多延伸 3~4pt，不越过页面底界)
+                min_scale_retry = min(1.0, max(0.48, 4.5 / b.size))
+                expanded_rect = fitz.Rect(rect.x0, rect.y0, rect.x1, min(target.rect.height - 2, rect.y1 + max(3, b.size * 0.25)))
+                spare, scale = p.insert_htmlbox(expanded_rect, content, css='*{margin:0;padding:0}', scale_low=min_scale_retry)
+                if spare >= 0:
+                    final_rect = expanded_rect
+                    min_scale = min_scale_retry
+
         if spare < 0:
             b.status, b.reason = 'review', '完整译文无法在可读字号下放入原区域；保留原文，译文见文本精读'
             continue
-        plans.append((b, rect, content, bg, min_scale))
+
+        b.reason = ''  # 成功排版，清除抽取时的初始保护标记
+        plans.append((b, final_rect, content, bg, min_scale))
 
     for b, rect, content, bg, min_scale in plans:
         if b.kind != 'ocr':
@@ -256,8 +286,7 @@ def render_blocks(original, target, blocks):
             target.draw_rect(rect, color=None, fill=bg, overlay=True)
         spare, _ = target.insert_htmlbox(rect, content, css='*{margin:0;padding:0}', scale_low=min_scale)
         if spare < 0:
-            # 若偶发排版微溢出，自适应允许缩放到 0.55 字号；若仍不足则平滑标记为待复核，绝不使整个任务崩溃
-            spare_retry, _ = target.insert_htmlbox(rect, content, css='*{margin:0;padding:0}', scale_low=0.55)
+            spare_retry, _ = target.insert_htmlbox(rect, content, css='*{margin:0;padding:0}', scale_low=0.45)
             if spare_retry < 0:
                 b.status, b.reason = 'review', '译文字数过多产生溢出，保留原排版'
                 continue
