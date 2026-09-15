@@ -56,3 +56,20 @@ def test_cancel_is_terminal_and_restart_preserves_completed(api):
 def test_client_cannot_supply_arbitrary_filesystem_path(api):
     response=api.post('/api/tasks',json={'file_id':'../../etc/passwd','model':'test','saved_path':'/etc/passwd'})
     assert response.status_code==422
+
+def test_pipeline_reports_page_and_safe_stack_without_exception_payload(api, monkeypatch, tmp_path, caplog):
+    task_id = 'c'*32
+    store.put_task({'task_id': task_id, 'stage': 'queued', 'filename': 'slides.pdf'}, 'test-owner')
+    monkeypatch.setattr(main, 'OUTPUT_DIR', tmp_path)
+    monkeypatch.setattr(main, 'CompatibleAdapter', lambda: object())
+    async def fail(source, output, adapter, model, mode, glossary, progress, cancel):
+        progress('rebuilding', 29, '重建第 2 / 10 页的原始版面')
+        raise RuntimeError('private-provider-payload-do-not-log')
+    monkeypatch.setattr(main, 'translate_pdf', fail)
+    body = main.TranslationRequest(file_id='d'*32, model='test')
+    main.run_pipeline(task_id, tmp_path/'slides.pdf', body)
+    task = store.get_task(task_id)
+    assert task['stage'] == 'failed'
+    assert '第 2 / 10 页' in task['message'] and task_id[:8] in task['message']
+    assert 'RuntimeError' in caplog.text and 'test_api.py:' in caplog.text
+    assert 'private-provider-payload' not in caplog.text + task['message']

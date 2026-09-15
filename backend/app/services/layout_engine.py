@@ -271,26 +271,37 @@ async def translate_pdf(source_path, output, adapter, model, mode, glossary, pro
             original, target = source[index], translated[index]
             if original.rect.get_area()*4 > 40_000_000:
                 raise ValueError('页面尺寸过大，请缩小后上传')
-            progress('parsing', 5 + int(index / len(source) * 85), f'解析第 {index+1} / {len(source)} 页')
+            progress('parsing', 5 + int(index / len(source) * 80), f'解析第 {index+1} / {len(source)} 页')
             blocks = extract_blocks(original)
             blocks, notes = add_ocr(original, blocks)
             warnings.extend(f'第 {index+1} 页：{note}' for note in notes)
             candidates = [{'id': b.id, 'text': b.text} for b in blocks if b.status == 'pending' or (b.kind == 'protected' and b.status == 'review')]
-            progress('translating', 10 + int(index / len(source) * 85), f'翻译第 {index+1} / {len(source)} 页 · {len(candidates)} 个区域')
+            progress('translating', 5 + int((index+.25) / len(source) * 80), f'翻译第 {index+1} / {len(source)} 页 · {len(candidates)} 个区域')
             values = await adapter.translate(candidates, model, mode, glossary)
             cancel()
             for block in blocks: block.translation = values.get(block.id, '')
-            progress('rebuilding', 15 + int(index / len(source) * 80), f'重建第 {index+1} / {len(source)} 页的原始版面')
+            progress('rebuilding', 5 + int((index+.6) / len(source) * 80), f'重建第 {index+1} / {len(source)} 页的原始版面')
             render_blocks(original, target, blocks)
             for label, doc_page in [('original', original), ('translated', target)]:
                 doc_page.get_pixmap(matrix=fitz.Matrix(1.5,1.5), alpha=False).save(str(output / f'{label}-{index+1}.png'))
             width, height = original.rect.width, original.rect.height
-            pair = paired.new_page(width=width*2, height=height)
-            pair.show_pdf_page(fitz.Rect(0, 0, width, height), source, index)
-            pair.show_pdf_page(fitz.Rect(width, 0, width*2, height), translated, index)
             pages.append({'page': index+1, 'width': width, 'height': height, 'orig_img': f'original-{index+1}.png', 'trans_img': f'translated-{index+1}.png', 'blocks': [asdict(b) for b in blocks]})
+        progress('rebuilding', 86, '整理译文字体并导出翻译 PDF')
         translated.subset_fonts()
         translated.save(output / 'translated.pdf', garbage=4, deflate=True)
+        # show_pdf_page caches a graft map sized for the source's object table.
+        # All edits (including font subsetting) must finish before the first graft:
+        # adding fonts on later pages otherwise exceeds that cached table at page 2.
+        for index, page in enumerate(pages):
+            cancel()
+            progress('rebuilding', 89 + int(index / len(pages) * 9), f'生成第 {index+1} / {len(pages)} 页双栏 PDF')
+            width, height = page['width'], page['height']
+            pair = paired.new_page(width=width*2, height=height)
+            if source[index].get_contents():
+                pair.show_pdf_page(fitz.Rect(0, 0, width, height), source, index)
+            if translated[index].get_contents():
+                pair.show_pdf_page(fitz.Rect(width, 0, width*2, height), translated, index)
+        progress('rebuilding', 98, '保存双栏 PDF')
         paired.subset_fonts()
         paired.save(output / 'bilingual.pdf', garbage=4, deflate=True)
         review = sum(b['status'] == 'review' for p in pages for b in p['blocks'])

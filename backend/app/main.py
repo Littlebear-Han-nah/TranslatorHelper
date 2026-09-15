@@ -7,6 +7,7 @@ import re
 import secrets
 import shutil
 import time
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Request, Response, HTTPException, Depends
@@ -128,10 +129,12 @@ def run_pipeline(task_id, path, body):
     def cancel():
         if store.get_task(task_id)['stage'] == 'cancelled': raise Cancelled()
     last_percent = 0
+    last_message = '初始化文档处理'
     def progress(stage, percent, message):
-        nonlocal last_percent
+        nonlocal last_percent, last_message
         cancel()
         last_percent = max(last_percent, min(percent, 99))
+        last_message = message
         store.update(task_id, stage=stage, percent=last_percent, message=message)
     async def execute():
         output = OUTPUT_DIR / task_id
@@ -168,8 +171,13 @@ def run_pipeline(task_id, path, body):
         except (ModelError, ValueError) as exc:
             store.update(task_id, stage='failed', message=str(exc))
         except Exception as exc:
-            logger.error('Translation %s failed: %s', task_id, type(exc).__name__)
-            store.update(task_id, stage='failed', message='文档处理失败，请检查文件内容或服务端文档工具配置')
+            # Frame locations diagnose engine errors without logging document text,
+            # exception payloads, request bodies, or local variables containing keys.
+            frames = ' -> '.join(f'{Path(frame.filename).name}:{frame.lineno}:{frame.name}'
+                                 for frame in traceback.extract_tb(exc.__traceback__))
+            logger.error('Translation %s failed: %s; stage=%s; frames=%s',
+                         task_id, type(exc).__name__, last_message, frames)
+            store.update(task_id, stage='failed', message=f'文档处理失败：{last_message}（{type(exc).__name__}；任务 {task_id[:8]}）。请提供此错误信息以便排查。')
     asyncio.run(execute())
 
 async def run_job(task_id, path, body):

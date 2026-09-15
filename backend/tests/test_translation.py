@@ -81,6 +81,60 @@ def test_formula_font_is_protected():
     assert blocks[0].kind=='protected'
     doc.close()
 
+def test_multi_page_courseware_exports_every_bilingual_page(tmp_path):
+    # With 48 pages, the former interleaved edit/graft loop crashed on page 2
+    # at 16% with FzErrorArgument: source object number out of range.
+    source = tmp_path / 'courseware.pdf'
+    with fitz.open() as doc:
+        for index in range(48):
+            page = doc.new_page(width=720, height=405)
+            page.draw_rect(fitz.Rect(20, 20, 700, 90), fill=(.85, .92, .87), color=None)
+            page.insert_text((40, 60), 'Layout matters', fontsize=24)
+            page.insert_text((40, 130), 'Hello world', fontsize=18)
+            page.insert_text((350, 385), str(index+1), fontsize=10)
+        doc.save(source)
+    progress = []
+    result = run(translate_pdf(source, tmp_path, FakeAdapter(), 'test', 'courseware', '',
+                               lambda *args: progress.append(args), noop))
+    with fitz.open(tmp_path/'translated.pdf') as translated, fitz.open(tmp_path/'bilingual.pdf') as paired:
+        assert len(result['pages']) == len(translated) == len(paired) == 48
+        for index in range(48):
+            assert '版面很重要' in translated[index].get_text()
+            assert 'Layout matters' not in translated[index].get_text()
+            left = paired[index].get_text(clip=fitz.Rect(0, 0, 720, 405))
+            right = paired[index].get_text(clip=fitz.Rect(720, 0, 1440, 405))
+            assert 'Layout matters' in left and '版面很重要' not in left
+            assert '版面很重要' in right and 'Layout matters' not in right
+            assert str(index+1) in left.splitlines() and str(index+1) in right.splitlines()
+            # Exported vector pages must render, not merely contain text objects.
+            assert paired[index].get_pixmap(matrix=fitz.Matrix(.25, .25)).width == 360
+    assert all(a[1] <= b[1] for a, b in zip(progress, progress[1:]))
+
+def test_bilingual_export_keeps_blank_slides_and_supports_cancellation(tmp_path, monkeypatch):
+    from backend.app.services import layout_engine
+    monkeypatch.setattr(layout_engine, 'add_ocr', lambda page, blocks: (blocks, []))
+    source = tmp_path/'blank.pdf'
+    with fitz.open() as doc:
+        doc.new_page()
+        doc.new_page().insert_text((40, 50), 'Hello world')
+        doc.save(source)
+    run(translate_pdf(source, tmp_path, FakeAdapter(), 'test', 'courseware', '', noop, noop))
+    with fitz.open(tmp_path/'bilingual.pdf') as doc:
+        assert len(doc) == 2
+        assert not doc[0].get_text().strip()
+        assert '你好世界' in doc[1].get_text()
+    class Cancelled(Exception): pass
+    assembling = False
+    def progress(stage, percent, message):
+        nonlocal assembling
+        if '双栏 PDF' in message:
+            assembling = True
+    def cancel():
+        if assembling:
+            raise Cancelled()
+    with pytest.raises(Cancelled):
+        run(translate_pdf(source, tmp_path, FakeAdapter(), 'test', 'courseware', '', progress, cancel))
+
 def test_word_preserves_tables_equations_styles_and_media(tmp_path):
     from docx import Document
     from docx.oxml import OxmlElement
