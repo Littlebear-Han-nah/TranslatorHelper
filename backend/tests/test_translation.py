@@ -52,6 +52,21 @@ def test_adapter_recovers_when_large_json_batch_loses_ids():
     assert run(adapter.translate(blocks, 'test')) == {str(i): '中文' for i in range(5)}
     assert calls[0] == 5 and calls.count(1) == 5
 
+
+def test_adapter_translates_repeated_slide_text_once():
+    requested = []
+    def respond(request):
+        items = json.loads(json.loads(request.content)['messages'][1]['content'])
+        requested.extend(items)
+        return httpx.Response(200, json={'choices': [{'message': {
+            'content': json.dumps({item['id']: '你好世界' for item in items})}}]})
+    adapter = CompatibleAdapter(api_key='test-only', transport=httpx.MockTransport(respond))
+    blocks = [{'id': f'slide-{i}', 'text': 'Hello world'} for i in range(50)]
+    result = run(adapter.translate(blocks, 'test'))
+    assert len(requested) == 1
+    assert len(result) == 50
+    assert set(result.values()) == {'你好世界'}
+
 def test_layout_never_deletes_text_when_translation_overflows():
     doc=fitz.open(); page=doc.new_page()
     page.insert_text((40,50),'Hello world',fontsize=12)

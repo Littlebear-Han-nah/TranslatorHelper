@@ -116,11 +116,16 @@ class CompatibleAdapter:
         if not blocks:
             return {}
         results, pending, protected = {}, [], {}
+        first_id_by_key, duplicate_ids = {}, {}
         for block in blocks:
             key = (model, mode, glossary, block['text'])
             if key in self.cache:
                 results[block['id']] = self.cache[key]
                 continue
+            if key in first_id_by_key:
+                duplicate_ids[block['id']] = first_id_by_key[key]
+                continue
+            first_id_by_key[key] = block['id']
             text, tokens = protect(block['text'])
             protected[block['id']] = tokens
             pending.append({'id': block['id'], 'text': text})
@@ -203,6 +208,8 @@ class CompatibleAdapter:
             batch_results = await asyncio.gather(*(translate_single_batch(b) for b in batches))
             for b_res in batch_results:
                 results.update(b_res)
+        for duplicate_id, first_id in duplicate_ids.items():
+            results[duplicate_id] = results[first_id]
 
         for block in blocks:
             if block['id'] in results:
