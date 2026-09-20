@@ -301,45 +301,57 @@ def pair_office_pdfs(original_path, translated_path, output, progress, cancel):
     """Build slide previews from the already translated PPTX conversion."""
     output = Path(output)
     pages, warnings = [], []
-    with fitz.open(original_path) as original, fitz.open(translated_path) as translated, fitz.open() as paired:
+    with fitz.open(original_path) as original, fitz.open(translated_path) as translated:
         if not len(original) or len(original) != len(translated) or len(original) > MAX_PAGES:
             raise ValueError('原文与译文幻灯片页数不一致')
-        for index in range(len(original)):
-            cancel()
-            left, right = original[index], translated[index]
-            if abs(left.rect.width - right.rect.width) > 2 or abs(left.rect.height - right.rect.height) > 2:
-                raise ValueError('原文与译文幻灯片尺寸不一致')
-            progress('rebuilding', 46 + int((index + 1) / len(original) * 50),
-                     f'生成第 {index + 1} / {len(original)} 页课件预览')
-            for label, page in (('original', left), ('translated', right)):
-                pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
-                pix.save(str(output / f'{label}-{index + 1}.png'))
-                del pix
-            width, height = left.rect.width, left.rect.height
-            pair = paired.new_page(width=width * 2, height=height)
-            if left.get_contents():
-                pair.show_pdf_page(fitz.Rect(0, 0, width, height), original, index)
-            if right.get_contents():
-                pair.show_pdf_page(fitz.Rect(width, 0, width * 2, height), translated, index)
-            source_text, target_text = left.get_text().strip(), right.get_text().strip()
-            blocks = []
-            if source_text or target_text:
-                target_lines = {line.strip() for line in target_text.splitlines()}
-                unchanged = [line.strip() for line in source_text.splitlines()
-                             if len(line.strip()) >= 8 and translatable(line)
-                             and line.strip() in target_lines]
-                if unchanged:
-                    warnings.append(f'第 {index + 1} 页有 {len(unchanged)} 行英文仍与原文相同，请检查译文。')
-                blocks.append(asdict(Block(f'p{index + 1}-b1', source_text,
-                                           [0, 0, width, height],
-                                           status='review' if unchanged else 'translated',
-                                           translation=target_text,
-                                           reason='部分英文仍与原文相同' if unchanged else '')))
-            pages.append({'page': index + 1, 'width': width, 'height': height,
-                          'orig_img': f'original-{index + 1}.png',
-                          'trans_img': f'translated-{index + 1}.png', 'blocks': blocks})
-        progress('rebuilding', 98, '保存双栏 PDF')
-        paired.save(output / 'bilingual.pdf', deflate=True)
+        page_count = len(original)
+    # show_pdf_page retains imported images and fonts in the destination document.
+    # A single 40-slide destination can exceed the 512 MiB worker limit. Close
+    # all three PDF documents every two slides, then append incrementally.
+    paired_path = output / 'bilingual.pdf'
+    for start in range(0, page_count, 2):
+        with fitz.open(original_path) as original, fitz.open(translated_path) as translated:
+            with (fitz.open(paired_path) if start else fitz.open()) as paired:
+                for index in range(start, min(start + 2, page_count)):
+                    cancel()
+                    left, right = original[index], translated[index]
+                    if abs(left.rect.width - right.rect.width) > 2 or abs(left.rect.height - right.rect.height) > 2:
+                        raise ValueError('原文与译文幻灯片尺寸不一致')
+                    progress('rebuilding', 46 + int((index + 1) / page_count * 50),
+                             f'生成第 {index + 1} / {page_count} 页课件预览')
+                    for label, page in (('original', left), ('translated', right)):
+                        pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+                        pix.save(str(output / f'{label}-{index + 1}.png'))
+                        del pix
+                    width, height = left.rect.width, left.rect.height
+                    pair = paired.new_page(width=width * 2, height=height)
+                    if left.get_contents():
+                        pair.show_pdf_page(fitz.Rect(0, 0, width, height), original, index)
+                    if right.get_contents():
+                        pair.show_pdf_page(fitz.Rect(width, 0, width * 2, height), translated, index)
+                    source_text, target_text = left.get_text().strip(), right.get_text().strip()
+                    blocks = []
+                    if source_text or target_text:
+                        target_lines = {line.strip() for line in target_text.splitlines()}
+                        unchanged = [line.strip() for line in source_text.splitlines()
+                                     if len(line.strip()) >= 8 and translatable(line)
+                                     and line.strip() in target_lines]
+                        if unchanged:
+                            warnings.append(f'第 {index + 1} 页有 {len(unchanged)} 行英文仍与原文相同，请检查译文。')
+                        blocks.append(asdict(Block(f'p{index + 1}-b1', source_text,
+                                                   [0, 0, width, height],
+                                                   status='review' if unchanged else 'translated',
+                                                   translation=target_text,
+                                                   reason='部分英文仍与原文相同' if unchanged else '')))
+                    pages.append({'page': index + 1, 'width': width, 'height': height,
+                                  'orig_img': f'original-{index + 1}.png',
+                                  'trans_img': f'translated-{index + 1}.png', 'blocks': blocks})
+                cancel()
+                if start:
+                    paired.saveIncr()
+                else:
+                    paired.save(paired_path, deflate=True)
+    progress('rebuilding', 98, '双栏 PDF 已保存')
     return {'pages': pages, 'translated_pdf': 'translated.pdf',
             'bilingual_pdf': 'bilingual.pdf', 'warnings': warnings}
 

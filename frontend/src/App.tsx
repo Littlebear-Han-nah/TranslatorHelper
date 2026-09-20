@@ -64,7 +64,9 @@ async function api(path: string, init?: RequestInit) {
   const response = await fetch(path, init);
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    throw new Error(data.detail || `请求失败 (${response.status})`);
+    const error = new Error(data.detail || `请求失败 (${response.status})`);
+    Object.assign(error, { status: response.status });
+    throw error;
   }
   return response.json();
 }
@@ -199,7 +201,21 @@ export default function App() {
           })
           .catch((e) => {
             if (e.name !== "AbortError") {
-              setError(e.message);
+              if (e.status === 404) {
+                setTask((current) =>
+                  current?.task_id === task.task_id
+                    ? {
+                        ...current,
+                        stage: "failed",
+                        message:
+                          "任务记录已丢失，可能是服务在处理文档时重启。请重新上传文件重试。",
+                      }
+                    : current,
+                );
+                refresh();
+              } else {
+                setError(e.message);
+              }
               setBusy(false);
             }
           }),
