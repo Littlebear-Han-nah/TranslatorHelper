@@ -10,7 +10,7 @@ from PIL import Image
 from lxml import etree
 from backend.app.services.model_adapter import CompatibleAdapter, ModelError
 from backend.app.services.layout_engine import Block, extract_blocks, render_blocks, translate_pdf
-from backend.app.services.office_engine import translate_native, validate_office, W, A, S
+from backend.app.services.office_engine import translate_native, translate_office, validate_office, W, A, S
 
 def run(coroutine): return asyncio.run(coroutine)
 
@@ -37,6 +37,20 @@ def test_adapter_rejects_incomplete_response(reply):
 def test_adapter_does_not_leak_provider_error():
     adapter=CompatibleAdapter(api_key='test-only',transport=httpx.MockTransport(lambda _: httpx.Response(401,text='private details')))
     with pytest.raises(ModelError,match='拒绝访问'): run(adapter.chat('test',[]))
+
+
+def test_adapter_recovers_when_large_json_batch_loses_ids():
+    calls = []
+    def respond(request):
+        items = json.loads(json.loads(request.content)['messages'][1]['content'])
+        calls.append(len(items))
+        selected = items[:1] if len(items) > 1 else items
+        answer = {item['id']: '中文' for item in selected}
+        return httpx.Response(200, json={'choices': [{'message': {'content': json.dumps(answer)}}]})
+    adapter = CompatibleAdapter(api_key='test-only', transport=httpx.MockTransport(respond))
+    blocks = [{'id': str(i), 'text': f'English sentence {i}'} for i in range(5)]
+    assert run(adapter.translate(blocks, 'test')) == {str(i): '中文' for i in range(5)}
+    assert calls[0] == 5 and calls.count(1) == 5
 
 def test_layout_never_deletes_text_when_translation_overflows():
     doc=fitz.open(); page=doc.new_page()
@@ -170,6 +184,67 @@ def test_powerpoint_preserves_slide_geometry_and_picture(tmp_path):
         for name in src.namelist():
             if name.startswith('ppt/media/'): assert src.read(name)==dst.read(name)
 
+
+def test_large_powerpoint_uses_translated_slides_for_pdf_without_second_model_pass(tmp_path, monkeypatch):
+    from pptx import Presentation
+    from pptx.util import Inches
+    from backend.app.services import office_engine
+    deck = Presentation()
+    for index in range(50):
+        slide = deck.slides.add_slide(deck.slide_layouts[6])
+        slide.shapes.add_textbox(Inches(1), Inches(1), Inches(5), Inches(1)).text = 'Hello world'
+    source = tmp_path / 'deck.pptx'
+    deck.save(source)
+
+    def fake_to_pdf(path, output):
+        result = Path(output) / f'{Path(path).stem}.pdf'
+        translated = Path(path).stem == 'translated'
+        with fitz.open() as pdf:
+            for _ in range(50):
+                page = pdf.new_page(width=720, height=405)
+                page.insert_text((40, 60), 'Translated' if translated else 'Hello world')
+            pdf.save(result)
+        return result
+
+    class CountingAdapter(FakeAdapter):
+        calls = 0
+        async def translate(self, blocks, *args):
+            self.calls += 1
+            return await super().translate(blocks, *args)
+
+    monkeypatch.setattr(office_engine, 'to_pdf', fake_to_pdf)
+    adapter = CountingAdapter()
+    result = run(translate_office(source, tmp_path, adapter, 'test', 'courseware', '', noop, noop))
+    assert adapter.calls == 1
+    assert len(result['pages']) == 50
+    with fitz.open(tmp_path / 'bilingual.pdf') as paired:
+        assert len(paired) == 50
+        assert 'Hello world' in paired[49].get_text()
+        assert 'Translated' in paired[49].get_text()
+
+
+def test_powerpoint_chart_labels_are_translated(tmp_path):
+    from pptx import Presentation
+    from pptx.chart.data import CategoryChartData
+    from pptx.enum.chart import XL_CHART_TYPE
+    from pptx.util import Inches
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    chart = CategoryChartData()
+    chart.categories = ['Revenue', 'Profit']
+    chart.add_series('Sales', [2, 3])
+    slide.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(1), Inches(1),
+                           Inches(5), Inches(3), chart)
+    source, target = tmp_path / 'chart.pptx', tmp_path / 'chart-translated.pptx'
+    deck.save(source)
+    run(translate_native(source, target, FakeAdapter(), 'test', 'academic', '', noop, noop))
+    with zipfile.ZipFile(target) as archive:
+        chart_xml = archive.read('ppt/charts/chart1.xml').decode()
+        assert 'Revenue' not in chart_xml
+        assert 'Profit' not in chart_xml
+        assert 'Sales' not in chart_xml
+        assert '文档翻译保留原始结构' in chart_xml
+
 def test_excel_preserves_formulas_merges_styles_and_formula_literals(tmp_path):
     from openpyxl import Workbook,load_workbook
     from openpyxl.styles import Font
@@ -244,3 +319,25 @@ def test_ocr_does_not_merge_table_columns(monkeypatch):
     assert [b.text for b in blocks]==['Model','Accuracy']
     assert blocks[0].bbox[2] < blocks[1].bbox[0]
     doc.close()
+
+
+def test_ocr_checks_large_image_even_when_page_has_native_text(monkeypatch):
+    import pytesseract
+    from backend.app.services import layout_engine
+    monkeypatch.setattr(layout_engine.shutil, 'which', lambda _: '/test/tesseract')
+    monkeypatch.setattr(pytesseract, 'image_to_data', lambda *a, **k: {
+        'text': ['Embedded', 'English'], 'block_num': [1, 1],
+        'par_num': [1, 1], 'line_num': [1, 1], 'left': [200, 310],
+        'top': [200, 200], 'width': [100, 90], 'height': [24, 24],
+        'conf': [99, 99]})
+    with fitz.open() as doc:
+        page = doc.new_page(width=400, height=300)
+        page.insert_text((10, 20), 'Native English heading with enough characters to trigger old skip')
+        page.insert_text((10, 280), 'Additional native English text')
+        image = Image.new('RGB', (300, 200), 'white')
+        data = io.BytesIO(); image.save(data, format='PNG')
+        page.insert_image(fitz.Rect(50, 50, 350, 250), stream=data.getvalue())
+        blocks = extract_blocks(page)
+        assert sum(len(block.text) for block in blocks) >= 50
+        found, _ = layout_engine.add_ocr(page, blocks)
+        assert any(block.kind == 'ocr' and block.text == 'Embedded English' for block in found)

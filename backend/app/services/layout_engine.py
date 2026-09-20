@@ -147,10 +147,12 @@ def add_ocr(page, blocks):
     images = [fitz.Rect(item['bbox']) for item in page.get_image_info()]
     native_length = sum(len(b.text) for b in blocks)
 
-    # 若页面已有较为充足的原生可选中文本（字符数 >= 50 且至少 2 个块），视为正常矢量排版文档，直接跳过耗时 OCR
-    if native_length >= 50 and len(blocks) >= 2:
+    large_images = any(r.get_area() > page.rect.get_area() * .15 for r in images)
+    # Selectable text elsewhere on the page does not rule out English inside
+    # a screenshot or diagram occupying a substantial part of the page.
+    if native_length >= 50 and len(blocks) >= 2 and not large_images:
         return blocks, []
-    if native_length >= 20 and not any(r.get_area() > page.rect.get_area() * .15 for r in images):
+    if native_length >= 20 and not large_images:
         return blocks, []
     if not images and native_length >= 20:
         return blocks, []
@@ -206,73 +208,10 @@ def render_blocks(original, target, blocks):
     """将翻译后的文本原位渲染回目标 PDF，包含预检、原位擦除与自适应字号排版。"""
     plans = []
     # 在独立刮板页上先进行排版预检，确保文字能够平整收纳
-    for b in blocks:
-        # 如果未翻译或翻译内容为空，或者明确保留非英文，则跳过
-        if b.status not in ('pending', 'review') or not b.translation:
-            continue
-        if b.translation == b.text:
-            b.status, b.reason = 'review', '模型返回与原文相同的文字，保留原样'
-            continue
-        rect = fitz.Rect(b.bbox) & target.rect
-        if rect.is_empty or rect.width < 3 or rect.height < 3:
-            b.status, b.reason = 'review', '区域尺寸无效'
-            continue
-
-        # 重叠检测：只有当重叠面积超过较小块面积的 60% 时，才视为严重冲突，避免课件中相邻紧凑的文字框被误判跳过
-        is_heavily_overlapping = False
-        rect_area = rect.get_area()
-        for other in blocks:
-            if other.id != b.id and other.status in ('pending', 'review') and other.translation:
-                other_rect = fitz.Rect(other.bbox) & target.rect
-                overlap_area = (rect & other_rect).get_area()
-                min_area = min(rect_area, other_rect.get_area())
-                if min_area > 0 and (overlap_area / min_area) > 0.6:
-                    is_heavily_overlapping = True
-                    break
-        if is_heavily_overlapping:
-            b.status, b.reason = 'review', '文字区域重叠，需人工检查'
-            continue
-
-        bg = None
-        if b.kind == 'ocr':
-            pix = original.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-            im = Image.frombytes('RGB', (pix.width, pix.height), pix.samples)
-            del pix
-            x0, y0, x1, y1 = [int(v * 2) for v in b.bbox]
-            strips = [(max(0,x0-2),max(0,y0-4),min(im.width,x1+2),max(1,y0-1)), (max(0,x0-2),min(im.height-1,y1+1),min(im.width,x1+2),min(im.height,y1+4))]
-            samples = [im.crop(r) for r in strips if r[2]>r[0] and r[3]>r[1]]
-            stats = [ImageStat.Stat(s) for s in samples]
-            if not stats or any(max(s.stddev) > 18 for s in stats):
-                b.status, b.reason = 'review', '扫描文字背景复杂，保留原图'
-                continue
-            bg = tuple(sum(s.median[k] for s in stats)/len(stats)/255 for k in range(3))
-            b.color = 0xffffff if sum(bg) < 1.5 else 0x20251f
-            rect = fitz.Rect(rect.x0-1.5, rect.y0-1, rect.x1+1.5, rect.y1+1) & target.rect
-
-        content = html_content(b, b.translation)
-
-        # 排版预检与自适应弹性缩放：
-        # 针对中文字形特点，先按常规字号测试；若微小溢出，自适应适度缩放并给予微小安全延伸
-        final_rect = rect
-        with fitz.open() as probe:
-            p = probe.new_page(width=target.rect.width, height=target.rect.height)
-            min_scale = min(1.0, max(0.6, 6.0 / b.size))
-            spare, scale = p.insert_htmlbox(rect, content, css='*{margin:0;padding:0}', scale_low=min_scale)
-            if spare < 0:
-                # 尝试更弹性的最小字号 (最低 0.48) 并给予垂直方向微小安全容差 (最多延伸 3~4pt，不越过页面底界)
-                min_scale_retry = min(1.0, max(0.48, 4.5 / b.size))
-                expanded_rect = fitz.Rect(rect.x0, rect.y0, rect.x1, min(target.rect.height - 2, rect.y1 + max(3, b.size * 0.25)))
-                spare, scale = p.insert_htmlbox(expanded_rect, content, css='*{margin:0;padding:0}', scale_low=min_scale_retry)
-                if spare >= 0:
-                    final_rect = expanded_rect
-                    min_scale = min_scale_retry
-
-        if spare < 0:
-            b.status, b.reason = 'review', '完整译文无法在可读字号下放入原区域；保留原文，译文见文本精读'
-            continue
-
-        b.reason = ''  # 成功排版，清除抽取时的初始保护标记
-        plans.append((b, final_rect, content, bg, min_scale))
+    with fitz.open() as probe:
+        scratch = probe.new_page(width=target.rect.width, height=target.rect.height)
+        for b in blocks:
+            plan_block(b, blocks, original, target, scratch, plans)
 
     for b, rect, content, bg, min_scale in plans:
         if b.kind != 'ocr':
@@ -286,12 +225,123 @@ def render_blocks(original, target, blocks):
             target.draw_rect(rect, color=None, fill=bg, overlay=True)
         spare, _ = target.insert_htmlbox(rect, content, css='*{margin:0;padding:0}', scale_low=min_scale)
         if spare < 0:
-            spare_retry, _ = target.insert_htmlbox(rect, content, css='*{margin:0;padding:0}', scale_low=0.45)
-            if spare_retry < 0:
-                b.status, b.reason = 'review', '译文字数过多产生溢出，保留原排版'
-                continue
+            raise RuntimeError('排版预检与写入结果不一致')
         b.status = 'translated'
     return blocks
+
+
+def plan_block(b, blocks, original, target, scratch, plans):
+    # 如果未翻译或翻译内容为空，或者明确保留非英文，则跳过
+    if b.status not in ('pending', 'review') or not b.translation or b.kind == 'protected':
+        return
+    if b.translation == b.text:
+        b.status, b.reason = 'review', '模型返回与原文相同的文字，保留原样'
+        return
+    rect = fitz.Rect(b.bbox) & target.rect
+    if rect.is_empty or rect.width < 3 or rect.height < 3:
+        b.status, b.reason = 'review', '区域尺寸无效'
+        return
+
+    # 重叠检测：只有当重叠面积超过较小块面积的 60% 时，才视为严重冲突，避免课件中相邻紧凑的文字框被误判跳过
+    is_heavily_overlapping = False
+    rect_area = rect.get_area()
+    for other in blocks:
+        if other.id != b.id and other.status in ('pending', 'review') and other.translation:
+            other_rect = fitz.Rect(other.bbox) & target.rect
+            overlap_area = (rect & other_rect).get_area()
+            min_area = min(rect_area, other_rect.get_area())
+            if min_area > 0 and (overlap_area / min_area) > 0.6:
+                is_heavily_overlapping = True
+                break
+    if is_heavily_overlapping:
+        b.status, b.reason = 'review', '文字区域重叠，需人工检查'
+        return
+
+    bg = None
+    if b.kind == 'ocr':
+        pix = original.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        im = Image.frombytes('RGB', (pix.width, pix.height), pix.samples)
+        del pix
+        x0, y0, x1, y1 = [int(v * 2) for v in b.bbox]
+        strips = [(max(0,x0-2),max(0,y0-4),min(im.width,x1+2),max(1,y0-1)), (max(0,x0-2),min(im.height-1,y1+1),min(im.width,x1+2),min(im.height,y1+4))]
+        samples = [im.crop(r) for r in strips if r[2]>r[0] and r[3]>r[1]]
+        stats = [ImageStat.Stat(s) for s in samples]
+        if not stats or any(max(s.stddev) > 18 for s in stats):
+            b.status, b.reason = 'review', '扫描文字背景复杂，保留原图'
+            return
+        bg = tuple(sum(s.median[k] for s in stats)/len(stats)/255 for k in range(3))
+        b.color = 0xffffff if sum(bg) < 1.5 else 0x20251f
+        rect = fitz.Rect(rect.x0-1.5, rect.y0-1, rect.x1+1.5, rect.y1+1) & target.rect
+
+    content = html_content(b, b.translation)
+
+    # 排版预检与自适应弹性缩放：
+    # 针对中文字形特点，先按常规字号测试；若微小溢出，自适应适度缩放并给予微小安全延伸
+    final_rect = rect
+    min_scale = min(1.0, max(0.6, 6.0 / b.size))
+    spare, scale = scratch.insert_htmlbox(rect, content, css='*{margin:0;padding:0}', scale_low=min_scale)
+    if spare < 0:
+        # 给译文增加一点高度，并在可读范围内缩小字号。
+        min_scale_retry = min(1.0, max(0.48, 4.5 / b.size))
+        expanded_rect = fitz.Rect(rect.x0, rect.y0, rect.x1, min(target.rect.height - 2, rect.y1 + max(3, b.size * 0.25)))
+        spare, scale = scratch.insert_htmlbox(expanded_rect, content, css='*{margin:0;padding:0}', scale_low=min_scale_retry)
+        if spare >= 0:
+            final_rect = expanded_rect
+            min_scale = min_scale_retry
+
+    if spare < 0:
+        b.status, b.reason = 'review', '完整译文无法在可读字号下放入原区域；保留原文，译文见文本精读'
+        return
+
+    b.reason = ''  # 成功排版，清除抽取时的初始保护标记
+    plans.append((b, final_rect, content, bg, min_scale))
+
+
+def pair_office_pdfs(original_path, translated_path, output, progress, cancel):
+    """Build slide previews from the already translated PPTX conversion."""
+    output = Path(output)
+    pages, warnings = [], []
+    with fitz.open(original_path) as original, fitz.open(translated_path) as translated, fitz.open() as paired:
+        if not len(original) or len(original) != len(translated) or len(original) > MAX_PAGES:
+            raise ValueError('原文与译文幻灯片页数不一致')
+        for index in range(len(original)):
+            cancel()
+            left, right = original[index], translated[index]
+            if abs(left.rect.width - right.rect.width) > 2 or abs(left.rect.height - right.rect.height) > 2:
+                raise ValueError('原文与译文幻灯片尺寸不一致')
+            progress('rebuilding', 46 + int((index + 1) / len(original) * 50),
+                     f'生成第 {index + 1} / {len(original)} 页课件预览')
+            for label, page in (('original', left), ('translated', right)):
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+                pix.save(str(output / f'{label}-{index + 1}.png'))
+                del pix
+            width, height = left.rect.width, left.rect.height
+            pair = paired.new_page(width=width * 2, height=height)
+            if left.get_contents():
+                pair.show_pdf_page(fitz.Rect(0, 0, width, height), original, index)
+            if right.get_contents():
+                pair.show_pdf_page(fitz.Rect(width, 0, width * 2, height), translated, index)
+            source_text, target_text = left.get_text().strip(), right.get_text().strip()
+            blocks = []
+            if source_text or target_text:
+                target_lines = {line.strip() for line in target_text.splitlines()}
+                unchanged = [line.strip() for line in source_text.splitlines()
+                             if len(line.strip()) >= 8 and translatable(line)
+                             and line.strip() in target_lines]
+                if unchanged:
+                    warnings.append(f'第 {index + 1} 页有 {len(unchanged)} 行英文仍与原文相同，请检查译文。')
+                blocks.append(asdict(Block(f'p{index + 1}-b1', source_text,
+                                           [0, 0, width, height],
+                                           status='review' if unchanged else 'translated',
+                                           translation=target_text,
+                                           reason='部分英文仍与原文相同' if unchanged else '')))
+            pages.append({'page': index + 1, 'width': width, 'height': height,
+                          'orig_img': f'original-{index + 1}.png',
+                          'trans_img': f'translated-{index + 1}.png', 'blocks': blocks})
+        progress('rebuilding', 98, '保存双栏 PDF')
+        paired.save(output / 'bilingual.pdf', deflate=True)
+    return {'pages': pages, 'translated_pdf': 'translated.pdf',
+            'bilingual_pdf': 'bilingual.pdf', 'warnings': warnings}
 
 async def translate_pdf(source_path, output, adapter, model, mode, glossary, progress, cancel):
     """整本 PDF 无痕翻译与双栏排版拼接主流程。"""
@@ -302,10 +352,11 @@ async def translate_pdf(source_path, output, adapter, model, mode, glossary, pro
         source.close(); raise ValueError('PDF 已加密，请先解锁后上传')
     if not 0 < len(source) <= MAX_PAGES:
         source.close(); raise ValueError(f'文档页数须为 1–{MAX_PAGES}')
-    # 标准化旋转角度，保持视觉与坐标一致性
-    for page in source:
-        if page.rotation: page.remove_rotation()
-    translated = fitz.open(stream=source.tobytes(), filetype='pdf')
+    # Open the input twice instead of holding an extra full-document byte copy.
+    translated = fitz.open(source_path)
+    for doc in (source, translated):
+        for page in doc:
+            if page.rotation: page.remove_rotation()
     paired = fitz.open()
     pages, warnings = [], []
     try:
@@ -321,21 +372,19 @@ async def translate_pdf(source_path, output, adapter, model, mode, glossary, pro
             candidates = [{'id': b.id, 'text': b.text} for b in blocks if b.status == 'pending' or (b.kind == 'protected' and b.status == 'review')]
             progress('translating', 5 + int((index+.25) / len(source) * 80), f'翻译第 {index+1} / {len(source)} 页 · {len(candidates)} 个区域')
             
-            # 单页大模型调用容错隔离：单个页面异常不中断整本 50 页任务
             try:
                 values = await adapter.translate(candidates, model, mode, glossary)
             except Exception as exc:
-                warnings.append(f'第 {index+1} 页模型响应异常（{type(exc).__name__}），本页保留原文')
-                values = {}
+                from .model_adapter import ModelError
+                if isinstance(exc, ModelError):
+                    raise ModelError(f'第 {index + 1} 页翻译失败：{exc}') from exc
+                raise
 
             cancel()
             for block in blocks: block.translation = values.get(block.id, '')
             progress('rebuilding', 5 + int((index+.6) / len(source) * 80), f'重建第 {index+1} / {len(source)} 页的原始版面')
             
-            try:
-                render_blocks(original, target, blocks)
-            except Exception as exc:
-                warnings.append(f'第 {index+1} 页排版写入遇到异常，已保留原文排版')
+            render_blocks(original, target, blocks)
 
             # 渲染页面预览图，显式清理 pixmap 避免多页内存暴涨导致容器 OOM
             for label, doc_page in [('original', original), ('translated', target)]:
@@ -373,4 +422,3 @@ async def translate_pdf(source_path, output, adapter, model, mode, glossary, pro
         return {'pages': pages, 'translated_pdf': 'translated.pdf', 'bilingual_pdf': 'bilingual.pdf', 'warnings': warnings}
     finally:
         source.close(); translated.close(); paired.close()
-

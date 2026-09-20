@@ -8,12 +8,13 @@ import tempfile
 import zipfile
 from pathlib import Path
 from lxml import etree
-from .layout_engine import translatable, translate_pdf
+from .layout_engine import translatable, translate_pdf, pair_office_pdfs
 
 W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
 S = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-NS = {'w': W, 'a': A, 's': S}
+C = 'http://schemas.openxmlformats.org/drawingml/2006/chart'
+NS = {'w': W, 'a': A, 's': S, 'c': C}
 PARSER = lambda: etree.XMLParser(resolve_entities=False, no_network=True, remove_blank_text=False)
 
 def office_binary():
@@ -63,9 +64,12 @@ def office_nodes(archive, extension):
                     elif value == 'end': field_depth = max(0, field_depth-1)
                 if node.tag in (f'{{{W}}}t', f'{{{A}}}t') and not field_depth and not any(p.tag == f'{{{W}}}fldSimple' for p in node.iterancestors()):
                     nodes.append(node)
-        elif extension == '.pptx' and re.match(r'ppt/(slides/slide\d+|notesSlides/notesSlide\d+|slideLayouts/slideLayout\d+|slideMasters/slideMaster\d+)\.xml$', name):
+        elif extension == '.pptx' and re.match(r'ppt/(slides/slide\d+|notesSlides/notesSlide\d+|slideLayouts/slideLayout\d+|slideMasters/slideMaster\d+|charts/chart\d+|diagrams/data\d+)\.xml$', name):
             tree = etree.fromstring(archive.read(name), PARSER())
             nodes = tree.findall('.//a:t', NS)
+            if name.startswith('ppt/charts/'):
+                nodes += tree.findall('.//c:strCache//c:v', NS)
+                nodes += tree.findall('.//c:multiLvlStrCache//c:v', NS)
         elif extension == '.xlsx' and (name == 'xl/sharedStrings.xml' or re.match(r'xl/worksheets/sheet\d+\.xml$', name)):
             tree = etree.fromstring(archive.read(name), PARSER())
             nodes = tree.findall('.//s:si//s:t', NS) + tree.findall('.//s:c[@t="inlineStr"]//s:t', NS)
@@ -82,9 +86,11 @@ async def translate_native(source, target, adapter, model, mode, glossary, progr
     with zipfile.ZipFile(source) as archive:
         parts, entries = office_nodes(archive, extension)
         report = []
-        for start in range(0, len(entries), 24):
+        # The adapter splits and runs requests concurrently. Feed it several
+        # batches at once instead of waiting for every 24 text nodes in turn.
+        for start in range(0, len(entries), 144):
             cancel()
-            batch = entries[start:start+24]
+            batch = entries[start:start+144]
             values = await adapter.translate([{'id': e['id'], 'text': e['text']} for e in batch], model, mode, glossary)
             for entry in batch:
                 translation = values[entry['id']]
@@ -107,7 +113,7 @@ def to_pdf(source, output):
         registry.mkdir()
         (registry / 'registrymodifications.xcu').write_text('''<?xml version="1.0"?><oor:items xmlns:oor="http://openoffice.org/2001/registry"><item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item></oor:items>''')
         try:
-            completed = subprocess.run([binary, f'-env:UserInstallation={Path(profile).as_uri()}', '--headless', '--nologo', '--nodefault', '--nolockcheck', '--norestore', '--convert-to', 'pdf', '--outdir', str(output), str(source)], capture_output=True, timeout=180)
+            completed = subprocess.run([binary, f'-env:UserInstallation={Path(profile).as_uri()}', '--headless', '--nologo', '--nodefault', '--nolockcheck', '--norestore', '--convert-to', 'pdf', '--outdir', str(output), str(source)], capture_output=True, timeout=300)
         except subprocess.TimeoutExpired:
             raise ValueError('Office 预览转换超时，请缩小文档后重试') from None
         expected = Path(output) / (Path(source).stem + '.pdf')
@@ -126,9 +132,21 @@ async def translate_office(source, output, adapter, model, mode, glossary, progr
         pdf = None
         warnings.append(str(exc))
     if pdf:
-        def pdf_progress(stage, percent, message): progress(stage, 45+int(percent*.5), message)
-        result = await translate_pdf(pdf, output, adapter, model, mode, glossary, pdf_progress, cancel)
-        warnings.append('对照 PDF 以原文 Office 转换出的页面为基准进行原位翻译，与原格式译文的自动分页可能不同。')
+        if Path(source).suffix.lower() == '.pptx':
+            # A slide has a fixed page boundary. Render the already translated
+            # PPTX, so a large deck does not pay for (or fail during) a second
+            # full-document model pass.
+            try:
+                translated_pdf = to_pdf(Path(output) / native_name, output)
+                result = pair_office_pdfs(pdf, translated_pdf, output, progress, cancel)
+            except (ValueError, RuntimeError):
+                def pdf_progress(stage, percent, message): progress(stage, 45+int(percent*.5), message)
+                result = await translate_pdf(pdf, output, adapter, model, mode, glossary, pdf_progress, cancel)
+                warnings.append('原格式课件转 PDF 未能保持页数，已改用原页面重建对照 PDF。')
+        else:
+            def pdf_progress(stage, percent, message): progress(stage, 45+int(percent*.5), message)
+            result = await translate_pdf(pdf, output, adapter, model, mode, glossary, pdf_progress, cancel)
+            warnings.append('对照 PDF 以原文 Office 转换出的页面为基准进行原位翻译，与原格式译文的自动分页可能不同。')
         result['warnings'].extend(warnings)
     else:
         result = {'pages': [], 'warnings': warnings + ['当前环境缺少可用的 LibreOffice 转换，已生成原格式译文；双栏 PDF 预览暂不可用。']}
