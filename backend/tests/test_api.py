@@ -44,6 +44,16 @@ def test_access_token_and_config_never_reveal_key(api,monkeypatch):
     assert api.post('/api/session',json={'token':'test-access-only'}).status_code==200
     assert api.get('/api/tasks').status_code==200
 
+
+def test_model_catalog_matches_available_model_ids(api):
+    ids = [model['id'] for model in api.get('/api/config').json()['models']]
+    assert ids == [
+        'qwen3.8-27b', 'qwen3.7-flash-2026-07-15', 'kimi-k3',
+        'deepseek-v4-flash-0731', 'qwen3.8-max-0902', 'glm-5.3',
+        'deepseek-v4-pro-0813', 'qwen3.8-2.4t-a95b', 'qwen3.8-max',
+        'qwen3.7-flash',
+    ]
+
 def test_cancel_is_terminal_and_restart_preserves_completed(api):
     user=hashlib.sha256(api.cookies.get('translator_session').encode()).hexdigest()
     store.put_task({'task_id':'b'*32,'stage':'translating','filename':'p.pdf'},user)

@@ -17,5 +17,16 @@ DEFAULT_MODEL = os.getenv('DEFAULT_MODEL', 'qwen3.7-flash')
 APP_ACCESS_TOKEN = os.getenv('APP_ACCESS_TOKEN', '')
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_PAGES = int(os.getenv('MAX_PAGES', '200'))
-_models = [('Qwen', 'qwen3.8-27b'), ('Qwen', 'qwen3.7-flash-2026-07-15'), ('Qwen', 'qwen3.8-max-0902'), ('Qwen', 'qwen3.7-flash'), ('Kimi', 'kimi-k3'), ('DeepSeek', 'deepseek-v4-flash-0731'), ('DeepSeek', 'deepseek-v4-pro-0813'), ('GLM', 'glm-5.2')]
+_models = [
+    ('Qwen', 'qwen3.8-27b'),
+    ('Qwen', 'qwen3.7-flash-2026-07-15'),
+    ('Kimi', 'kimi-k3'),
+    ('DeepSeek', 'deepseek-v4-flash-0731'),
+    ('Qwen', 'qwen3.8-max-0902'),
+    ('GLM', 'glm-5.3'),
+    ('DeepSeek', 'deepseek-v4-pro-0813'),
+    ('Qwen', 'qwen3.8-2.4t-a95b'),
+    ('Qwen', 'qwen3.8-max'),
+    ('Qwen', 'qwen3.7-flash'),
+]
 SUPPORTED_MODELS = json.loads(os.environ['MODEL_CATALOG_JSON']) if os.getenv('MODEL_CATALOG_JSON') else [{'id': m, 'name': m, 'provider': p} for p, m in _models]
