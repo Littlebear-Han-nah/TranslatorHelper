@@ -81,18 +81,25 @@ class CompatibleAdapter:
             raise ModelError('服务端尚未配置 DASHSCOPE_API_KEY')
         payload = {'model': model, 'messages': messages, 'max_tokens': max_tokens}
         client = await self.get_client()
-        for attempt in range(3):
+        # The configured gateway occasionally drops the TLS connection before
+        # returning an HTTP response. Give those transient failures enough
+        # time to recover during a long document instead of failing the whole
+        # task after only a few seconds.
+        attempts = 6
+        for attempt in range(attempts):
             try:
                 response = await client.post(
                     f'{self.base_url}/chat/completions',
                     headers={'Authorization': f'Bearer {self.api_key}'},
                     json=payload
                 )
-                if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
+                if response.status_code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                    await asyncio.sleep(min(2 ** attempt, 15))
                     continue
                 if response.status_code in (401, 403):
                     raise ModelError('模型接口拒绝访问，请检查服务端密钥及该模型的调用权限')
+                if response.status_code in (402, 429):
+                    raise ModelError(f'模型额度不足或请求受限（HTTP {response.status_code}），请检查模型账户额度')
                 if response.status_code >= 400:
                     raise ModelError(f'模型接口返回 HTTP {response.status_code}，请确认模型 ID 与服务商配置')
                 data = response.json()
@@ -104,9 +111,9 @@ class CompatibleAdapter:
                     raise ModelError('模型返回空结果，未进行文字替换')
                 return text.strip()
             except (httpx.TimeoutException, httpx.NetworkError):
-                if attempt == 2:
+                if attempt == attempts - 1:
                     raise ModelError('模型接口连接超时或网络不可达，请稍后重试') from None
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(min(2 ** attempt, 15))
             except (KeyError, IndexError, ValueError):
                 raise ModelError('模型接口响应格式无效，未进行文字替换') from None
         raise ModelError('模型请求失败')
@@ -170,7 +177,16 @@ class CompatibleAdapter:
                 except ValueError:
                     raise ModelError('模型未返回合法的结构化翻译；原文未被覆盖') from None
 
-                if not isinstance(values, dict) or set(values) != {b['id'] for b in current_batch}:
+                expected_ids = {b['id'] for b in current_batch}
+                # Some compatible models rewrite a long page/block ID even
+                # after a failed batch has been reduced to one item. With one
+                # input there is no ambiguity: keep the sole translated value
+                # and bind it to the requested ID. All content and protected
+                # token validation below still applies.
+                if (isinstance(values, dict) and len(current_batch) == 1
+                        and len(values) == 1 and set(values) != expected_ids):
+                    values = {current_batch[0]['id']: next(iter(values.values()))}
+                if not isinstance(values, dict) or set(values) != expected_ids:
                     raise ModelError('模型返回的区域编号不匹配；原文未被覆盖')
 
                 batch_res = {}

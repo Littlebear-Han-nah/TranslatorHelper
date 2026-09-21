@@ -53,6 +53,18 @@ def test_adapter_recovers_when_large_json_batch_loses_ids():
     assert calls[0] == 5 and calls.count(1) == 5
 
 
+def test_adapter_recovers_when_single_response_rewrites_the_id():
+    adapter = CompatibleAdapter(
+        api_key='test-only',
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={
+            'choices': [{'message': {'content': '{"translated_text":"中文译文"}'}}]
+        })),
+    )
+    assert run(adapter.translate(
+        [{'id': 'p37-b9', 'text': 'Sprint review'}], 'test'
+    )) == {'p37-b9': '中文译文'}
+
+
 def test_adapter_translates_repeated_slide_text_once():
     requested = []
     def respond(request):
