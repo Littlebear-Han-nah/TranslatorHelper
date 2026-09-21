@@ -1,0 +1,29 @@
+services:
+  translator:
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      DATA_DIR: /app/data
+      PORT: '8000'
+    # Private by default: use an SSH tunnel, or the HTTPS overlay below.
+    ports:
+      - '127.0.0.1:8000:8000'
+    volumes:
+      - translator-data:/app/data
+    stop_grace_period: 60s
+    healthcheck:
+      test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=5)']
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+volumes:
+  translator-data:
